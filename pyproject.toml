@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drawing-identifier"
+version = "0.1.0"
+description = "Agentic pipeline that identifies hand-drawn shapes, how they are connected/nested, and the text written inside and near them."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "pillow>=10.0",
+    "scikit-image>=0.21",
+    "scipy>=1.10",
+    "pydantic>=2.5",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.40"]
+gemini = ["google-genai>=1.0"]
+hf = ["torch>=2.2", "transformers>=4.49", "accelerate>=0.30", "peft>=0.12"]
+yolo = ["ultralytics>=8.3"]
+ocr = ["pytesseract>=0.3.10"]
+ui = ["gradio>=4.0"]
+dev = ["pytest>=7.4"]
+all = [
+    "anthropic>=0.40",
+    "openai>=1.40",
+    "google-genai>=1.0",
+    "torch>=2.2",
+    "transformers>=4.49",
+    "accelerate>=0.30",
+    "peft>=0.12",
+    "ultralytics>=8.3",
+    "gradio>=4.0",
+]
+
+[project.scripts]
+drawid = "drawing_identifier.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["drawing_identifier*"]
+
+[tool.setuptools.package-data]
+drawing_identifier = ["resources/*.yaml", "resources/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
