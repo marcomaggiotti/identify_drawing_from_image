@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# drawing_identifier artefacts
+assets/fonts/
+outputs/
+runs/
+models/
+data/
+*.pt
+!tests/**/*.pt

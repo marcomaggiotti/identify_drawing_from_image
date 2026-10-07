@@ -1,0 +1,44 @@
+# Example user configuration. Only the keys you set override drawing_identifier/resources/default.yaml.
+#   drawid analyze page.jpg --config configs/example.yaml
+#   drawid config            # prints every available key with its default
+
+# Which VLM the agents use: a profile below / in the defaults, an ad-hoc spec, "auto" or "none".
+default_vlm: claude
+
+# Mix models per agent: a cheap local model reads the many text crops,
+# a strong cloud model does the holistic reading, the verification and the planning.
+agent_vlms:
+  text_reader: ollama-qwen
+  vlm_analyst: claude
+  verifier: claude
+  planner: claude-sonnet
+
+vlms:
+  # your own profiles (or override the built-in ones by reusing their names)
+  lmstudio-qwen:
+    provider: openai_compatible
+    model: qwen2.5-vl-7b-instruct
+    base_url: http://localhost:1234/v1
+  openrouter-gemini:
+    provider: openai_compatible
+    model: google/gemini-2.5-flash
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+  gemini-pro:
+    provider: gemini
+    model: gemini-2.5-pro
+    api_key_env: GEMINI_API_KEY
+    bbox_format: xyxy_1000
+
+orchestrator:
+  mode: pipeline          # or "planner": the planner VLM chooses which agent runs next
+
+shapes:
+  detector: cv+yolo       # use the detector trained on synthetic data together with classical CV
+  weights: models/detector.pt
+
+text:
+  ocr: vlm                # vlm | trocr | tesseract | none
+
+verifier:
+  max_rounds: 2
