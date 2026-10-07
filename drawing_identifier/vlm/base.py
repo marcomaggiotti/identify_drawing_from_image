@@ -69,8 +69,77 @@ def encode_image(img: Image.Image, fmt: str = "PNG") -> tuple[str, str]:
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 
+def _strip_comments(snippet: str) -> str:
+    """Remove ``// ...`` line comments that sit outside JSON strings."""
+    out = []
+    in_str = esc = False
+    i = 0
+    while i < len(snippet):
+        ch = snippet[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif ch == "/" and snippet.startswith("//", i):
+            nl = snippet.find("\n", i)
+            i = len(snippet) if nl == -1 else nl
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _top_level_spans(cand: str):
+    """Yield outermost balanced {...}/[...] spans, in order of appearance."""
+    pairs = {"{": "}", "[": "]"}
+    i = 0
+    n = len(cand)
+    while i < n:
+        if cand[i] not in pairs:
+            i += 1
+            continue
+        stack = [pairs[cand[i]]]
+        in_str = esc = False
+        j = i + 1
+        while j < n and stack:
+            ch = cand[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            elif ch == '"':
+                in_str = True
+            elif ch in pairs:
+                stack.append(pairs[ch])
+            elif ch in ("}", "]"):
+                if ch != stack[-1]:
+                    break  # mismatched bracket: not a JSON value
+                stack.pop()
+            j += 1
+        if not stack:
+            yield cand[i:j]
+            i = j
+        else:
+            return  # unbalanced (e.g. truncated answer): nothing trustworthy after this point
+
+
 def extract_json(text: str) -> Any:
-    """Tolerant JSON extraction from a model answer (fences, prose around it...)."""
+    """Tolerant JSON extraction from a model answer (code fences, prose around it, comments, trailing commas).
+
+    Only *outermost* values are considered: a truncated or broken answer raises
+    ``ValueError`` (so callers can retry) instead of returning an inner fragment.
+    """
     if text is None:
         raise ValueError("empty response")
     candidates = [m.group(1) for m in _FENCE.finditer(text)] + [text]
@@ -80,41 +149,13 @@ def extract_json(text: str) -> Any:
             return json.loads(cand)
         except Exception:
             pass
-        # first balanced {...} or [...]
-        for open_c, close_c in (("{", "}"), ("[", "]")):
-            start = cand.find(open_c)
-            while start != -1:
-                depth = 0
-                in_str = False
-                esc = False
-                for i in range(start, len(cand)):
-                    ch = cand[i]
-                    if in_str:
-                        if esc:
-                            esc = False
-                        elif ch == "\\":
-                            esc = True
-                        elif ch == '"':
-                            in_str = False
-                        continue
-                    if ch == '"':
-                        in_str = True
-                    elif ch == open_c:
-                        depth += 1
-                    elif ch == close_c:
-                        depth -= 1
-                        if depth == 0:
-                            snippet = cand[start : i + 1]
-                            try:
-                                return json.loads(snippet)
-                            except Exception:
-                                # common model mistake: trailing commas
-                                try:
-                                    return json.loads(re.sub(r",\s*([}\]])", r"\1", snippet))
-                                except Exception:
-                                    break
-                start = cand.find(open_c, start + 1)
-    raise ValueError(f"no JSON object found in response: {text[:200]!r}")
+        for snippet in _top_level_spans(cand):
+            for fix in (lambda x: x, _strip_comments, lambda x: re.sub(r",\s*([}\]])", r"\1", _strip_comments(x))):
+                try:
+                    return json.loads(fix(snippet))
+                except Exception:
+                    continue
+    raise ValueError(f"no JSON value found in response: {text[:200]!r}")
 
 
 class VLMBackend(ABC):

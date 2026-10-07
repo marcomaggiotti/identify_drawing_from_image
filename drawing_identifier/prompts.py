@@ -37,7 +37,7 @@ Identify:
 2. every TEXT written inside or near a shape (also labels on lines). Transcribe it exactly, keep single letters and subscripts (e.g. "r", "A1", "loves");
 3. every CONNECTION: a drawn line or arrow joining shapes/texts (heavy lines of identity count). Give the ids of what each end touches.
 
-Coordinates: bbox = [x0, y0, x1, y1] as integers normalised to 0-1000 of the image width/height.
+Coordinates: {coords}
 Ignore paragraphs of running prose unless they are inside/next to a shape; ignore ruled paper lines and page borders.
 
 Return ONLY this JSON:
@@ -48,8 +48,16 @@ Return ONLY this JSON:
  "summary": "one sentence describing the diagram"}}"""
 
 
-def analysis_prompt() -> str:
-    return ANALYSIS_PROMPT.format(types=", ".join(SHAPE_TYPES))
+COORDS = {
+    "xyxy_1000": "bbox = [x0, y0, x1, y1] as integers normalised to 0-1000 of the image width/height; path points are [x, y] on the same scale.",
+    "yxyx_1000": "bbox = [y0, x0, y1, x1] as integers normalised to 0-1000 of the image height/width; path points are [y, x] on the same scale.",
+    "xyxy_pixels": "bbox = [x0, y0, x1, y1] in pixels of the image you are given; path points are [x, y] pixels.",
+}
+
+
+def analysis_prompt(bbox_format: str = "xyxy_1000") -> str:
+    """The analysis request; the JSON example keeps xyxy order, the text states the coordinate convention."""
+    return ANALYSIS_PROMPT.format(types=", ".join(SHAPE_TYPES), coords=COORDS.get(bbox_format, COORDS["xyxy_1000"]))
 
 
 TRIAGE_PROMPT = """Look at this image and decide whether it contains a drawing or diagram made by hand
@@ -72,18 +80,19 @@ shapes are outlined and labelled S<n>, connections are drawn as polylines labell
 Current analysis (JSON):
 {analysis}
 
-Find mistakes and return ONLY JSON with these keys (use [] / {{}} when nothing to change):
-{{"remove_shapes": ["S3"],                 // detections that are not real shapes (e.g. letters, page border)
- "retype_shapes": {{"S2": "rectangle"}},   // wrong shape type
- "add_shapes": [{{"type": "ellipse", "bbox": [x0, y0, x1, y1]}}],   // clearly visible shapes that were missed; bbox normalised 0-1000
- "text_corrections": {{"T4": "loves"}},     // wrong or missing transcription
- "remove_texts": ["T9"],
- "remove_connections": ["C2"],
- "add_connections": [{{"ends": ["T1", "S2"], "type": "line"}}],
- "rerun": [],                              // optionally ["shapes"] if many shapes were missed, ["text_reader"] if most text is wrong
- "is_complete": true,                      // true when the analysis is essentially right
- "issues": ["short description of each problem"],
- "summary": "one or two sentences describing what the diagram shows"}}"""
+Find mistakes and return ONLY a JSON object (no comments) with these keys; use [] or {{}} when nothing changes:
+- "remove_shapes": ids of detections that are not real shapes (letters, page border...), e.g. ["S3"]
+- "retype_shapes": wrong shape types, e.g. {{"S2": "rectangle"}}
+- "add_shapes": clearly visible shapes that were missed, e.g. [{{"type": "ellipse", "bbox": [x0, y0, x1, y1]}}] with bbox normalised 0-1000
+- "text_corrections": wrong or missing transcriptions, e.g. {{"T4": "loves"}}
+- "remove_texts": e.g. ["T9"]
+- "remove_connections": e.g. ["C2"]
+- "add_connections": e.g. [{{"ends": ["T1", "S2"], "type": "line"}}]
+- "rerun": optionally ["shapes"] if many shapes were missed, ["text_reader"] if most text is wrong
+- "is_complete": true when the analysis is essentially right, otherwise false
+- "issues": short description of each problem
+- "summary": one or two sentences describing what the diagram shows
+Example: {{"remove_shapes": [], "retype_shapes": {{}}, "add_shapes": [], "text_corrections": {{}}, "remove_texts": [], "remove_connections": [], "add_connections": [], "rerun": [], "is_complete": true, "issues": [], "summary": "..."}}"""
 
 PLANNER_PROMPT = """You coordinate a team of agents that analyse a hand drawing.
 Goal: find every shape (and its type), how shapes are nested/connected, and what is written inside and near them.
@@ -112,7 +121,26 @@ def to_norm_box(b: BBox, w: int, h: int) -> list[int]:
     ]
 
 
-def from_model_box(box: Any, w: int, h: int, fmt: str = "xyxy_1000") -> BBox | None:
+def _scale_for(fmt: str, w: int, h: int, sent: tuple[int, int] | None) -> tuple[float, float]:
+    """Multipliers from the model's coordinate space to analysis-image pixels."""
+    if fmt == "xyxy_pixels":
+        if sent and sent[0] and sent[1]:
+            return w / float(sent[0]), h / float(sent[1])  # the model saw a resized copy
+        return 1.0, 1.0
+    return w / 1000.0, h / 1000.0
+
+
+def from_model_point(p: Any, w: int, h: int, fmt: str = "xyxy_1000", sent: tuple[int, int] | None = None) -> tuple[float, float] | None:
+    try:
+        a, b = float(p[0]), float(p[1])
+    except Exception:
+        return None
+    x, y = (b, a) if fmt == "yxyx_1000" else (a, b)
+    sx, sy = _scale_for(fmt, w, h, sent)
+    return (min(max(0.0, x * sx), w), min(max(0.0, y * sy), h))
+
+
+def from_model_box(box: Any, w: int, h: int, fmt: str = "xyxy_1000", sent: tuple[int, int] | None = None) -> BBox | None:
     try:
         vals = [float(v) for v in box][:4]
     except Exception:
@@ -121,17 +149,36 @@ def from_model_box(box: Any, w: int, h: int, fmt: str = "xyxy_1000") -> BBox | N
         return None
     if fmt == "yxyx_1000":
         y0, x0, y1, x1 = vals
-        fmt = "xyxy_1000"
     else:
         x0, y0, x1, y1 = vals
-    if fmt == "xyxy_1000":
+    if fmt != "xyxy_pixels" and max(vals) <= 1.0:
         # tolerate models that answer 0..1 fractions
-        if max(vals) <= 1.0:
-            x0, y0, x1, y1 = x0 * 1000, y0 * 1000, x1 * 1000, y1 * 1000
-        x0, x1 = x0 * w / 1000.0, x1 * w / 1000.0
-        y0, y1 = y0 * h / 1000.0, y1 * h / 1000.0
+        x0, y0, x1, y1 = x0 * 1000, y0 * 1000, x1 * 1000, y1 * 1000
+    sx, sy = _scale_for(fmt, w, h, sent)
+    x0, x1, y0, y1 = x0 * sx, x1 * sx, y0 * sy, y1 * sy
     b = BBox.from_xyxy(max(0, x0), max(0, y0), min(w, x1), min(h, y1))
     return b if b.w > 1 and b.h > 1 else None
+
+
+def _ref(v: Any) -> str | None:
+    """Element reference from a model answer (ids may come back as ints)."""
+    if v is None or v is False or isinstance(v, (dict, list)):
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _as_bool(v: Any, default: bool | None = False) -> bool | None:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    t = str(v).strip().lower()
+    if t in ("true", "yes", "y", "1"):
+        return True
+    if t in ("false", "no", "n", "0", ""):
+        return False if t else default
+    return default
 
 
 def bbox_polygon(b: BBox, shape_type: ShapeType, n: int = 48) -> list[tuple[float, float]]:
@@ -222,19 +269,29 @@ def graph_to_vlm_target(g: DiagramGraph, w: int | None = None, h: int | None = N
     }
 
 
-def parse_vlm_graph(data: dict, w: int, h: int, bbox_format: str = "xyxy_1000", source: str = "vlm") -> DiagramGraph:
-    """Turn the model's JSON (see ANALYSIS_PROMPT) into a DiagramGraph in pixel coordinates."""
+def parse_vlm_graph(
+    data: dict,
+    w: int,
+    h: int,
+    bbox_format: str = "xyxy_1000",
+    source: str = "vlm",
+    sent_size: tuple[int, int] | None = None,
+) -> DiagramGraph:
+    """Turn the model's JSON (see ANALYSIS_PROMPT) into a DiagramGraph in pixel coordinates.
+
+    ``sent_size`` is the size of the image the model actually saw (needed for pixel bbox formats).
+    """
     g = DiagramGraph()
     g.image.width, g.image.height = w, h
     if not isinstance(data, dict):
         return g
-    g.is_drawing = data.get("is_drawing")
+    g.is_drawing = _as_bool(data.get("is_drawing"), None)
     g.summary = data.get("summary") or None
     ids: set[str] = set()
     for i, raw in enumerate(data.get("shapes") or [], 1):
         if not isinstance(raw, dict):
             continue
-        b = from_model_box(raw.get("bbox"), w, h, bbox_format)
+        b = from_model_box(raw.get("bbox"), w, h, bbox_format, sent_size)
         if b is None:
             continue
         st = _shape_type(raw.get("type"))
@@ -247,19 +304,20 @@ def parse_vlm_graph(data: dict, w: int, h: int, bbox_format: str = "xyxy_1000", 
                 bbox=b,
                 polygon=bbox_polygon(b, st),
                 confidence=0.6,
-                parent_id=raw.get("parent") or None,
-                crossed_out=bool(raw.get("crossed_out", False)),
+                parent_id=_ref(raw.get("parent")),
+                crossed_out=bool(_as_bool(raw.get("crossed_out"), False)),
                 source=[source],
             )
         )
     for i, raw in enumerate(data.get("texts") or [], 1):
         if not isinstance(raw, dict):
             continue
-        b = from_model_box(raw.get("bbox"), w, h, bbox_format)
+        b = from_model_box(raw.get("bbox"), w, h, bbox_format, sent_size)
         if b is None:
             continue
-        inside = raw.get("inside") or None
-        near = [str(x) for x in (raw.get("near") or []) if x]
+        inside = _ref(raw.get("inside"))
+        near_raw = raw.get("near") or []
+        near = [r for r in (_ref(x) for x in (near_raw if isinstance(near_raw, list) else [near_raw])) if r]
         placement = TextPlacement.INSIDE if inside else (TextPlacement.NEAR if near else TextPlacement.FREE)
         tid = str(raw.get("id") or f"T{i}")
         ids.add(tid)
@@ -271,7 +329,7 @@ def parse_vlm_graph(data: dict, w: int, h: int, bbox_format: str = "xyxy_1000", 
                 placement=placement,
                 inside_shape_id=inside,
                 near_shape_ids=near,
-                crossed_out=bool(raw.get("crossed_out", False)),
+                crossed_out=bool(_as_bool(raw.get("crossed_out"), False)),
                 confidence=0.6,
                 source=[source],
             )
@@ -283,15 +341,15 @@ def parse_vlm_graph(data: dict, w: int, h: int, bbox_format: str = "xyxy_1000", 
             continue
         path = []
         for p in raw.get("path") or []:
-            try:
-                path.append((float(p[0]) * w / 1000.0, float(p[1]) * h / 1000.0))
-            except Exception:
-                continue
-        ends = [e for e in (raw.get("ends") or [])]
+            q = from_model_point(p, w, h, bbox_format, sent_size)
+            if q is not None:
+                path.append(q)
+        ends_raw = raw.get("ends") or []
+        ends = list(ends_raw) if isinstance(ends_raw, list) else []
         eps = []
         for j, ref in enumerate(ends):
             pt = path[0] if (j == 0 and path) else (path[-1] if path else (0.0, 0.0))
-            ref = str(ref) if ref else None
+            ref = _ref(ref)
             eps.append(
                 Endpoint(
                     point=pt,
@@ -308,7 +366,7 @@ def parse_vlm_graph(data: dict, w: int, h: int, bbox_format: str = "xyxy_1000", 
                 type=ctype,
                 path=path,
                 endpoints=eps,
-                heavy=bool(raw.get("heavy", False)),
+                heavy=bool(_as_bool(raw.get("heavy"), False)),
                 confidence=0.6,
                 source=[source],
             )

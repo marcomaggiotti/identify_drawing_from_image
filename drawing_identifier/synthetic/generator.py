@@ -129,7 +129,7 @@ class SceneBuilder:
         self.shapes: list[_Shape] = []
         self.texts: list[_Text] = []
         self.conns: list[_Conn] = []
-        self.scribbles: list[np.ndarray] = []
+        self.scribbles: list[tuple[str, np.ndarray]] = []  # (crossed-out shape id, scribble path)
         self.fonts = list_fonts(cfg.fonts_dir)
         self._n = {"S": 0, "T": 0, "C": 0}
         self.margin = int(0.04 * min(self.W, self.H))
@@ -287,11 +287,13 @@ class SceneBuilder:
         rng = self.rng
         x0, y0, x1, y1 = box
         w, h = x1 - x0, y1 - y0
-        r = min(w / 3.2, h / 2.2)
+        st = ShapeType.CIRCLE if rng.random() < 0.5 else ShapeType.ELLIPSE
+        k = 1.0 if st == ShapeType.CIRCLE else 1.15  # half-width / r
+        # the pair spans 2 * (dx + k r) <= 2 r (0.85 + k) wide: keep it inside the box
+        r = min(w / (2 * (0.85 + k)), h / (2 * (1.0 if st == ShapeType.CIRCLE else 0.8)) * 0.95)
         cy = (y0 + y1) / 2
         cx = (x0 + x1) / 2
         dx = r * rng.uniform(0.55, 0.85)
-        st = ShapeType.CIRCLE if rng.random() < 0.5 else ShapeType.ELLIPSE
         ids = []
         for sx in (-1, 1):
             ww, hh = (2 * r, 2 * r) if st == ShapeType.CIRCLE else (2 * r * 1.15, 2 * r * 0.8)
@@ -471,7 +473,7 @@ class SceneBuilder:
         cand = [s for s in self.shapes if s.depth > 0] or self.shapes
         s = cand[int(self.rng.integers(0, len(cand)))]
         w, h = s.size
-        self.scribbles.append(scribble(s.center, (0.55 * w, 0.5 * h), self.rng, n=int(self.rng.integers(8, 20))))
+        self.scribbles.append((s.id, scribble(s.center, (0.55 * w, 0.5 * h), self.rng, n=int(self.rng.integers(8, 20)))))
         s.crossed_out = True
 
 
@@ -567,7 +569,7 @@ def render_scene(sc: SceneBuilder) -> np.ndarray:
                 R = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
                 barb = tip - (R @ d) * L
                 draw_stroke(ink, np.linspace(tip, barb, 6), c.width, 255, rng, taper=False)
-    for scr in sc.scribbles:
+    for _, scr in sc.scribbles:
         draw_stroke(ink, scr, sc.sw * 0.9, 255, rng, taper=False)
     for t in sc.texts:
         x0, y0, x1, y1 = t.box
@@ -674,12 +676,25 @@ def build_ground_truth(sc: SceneBuilder, M: np.ndarray, size: tuple[int, int], i
                 source=["synthetic"],
             )
         )
-    for i, scr in enumerate(sc.scribbles, 1):
+    depth = {s.id: s.depth for s in sc.shapes}
+    for i, (host, scr) in enumerate(sc.scribbles, 1):
         pts = _tx(M, scr)
         hull = cv2.convexHull(pts.astype(np.float32)).reshape(-1, 2)
-        g.shapes.append(Shape(id=f"S{len(sc.shapes) + i}", type=ShapeType.SCRIBBLE, bbox=BBox.from_points(pts).round(), polygon=_pl(hull), source=["synthetic"], crossed_out=True))
+        g.shapes.append(
+            Shape(
+                id=f"S{len(sc.shapes) + i}",
+                type=ShapeType.SCRIBBLE,
+                bbox=BBox.from_points(pts).round(),
+                polygon=_pl(hull),
+                parent_id=host,
+                depth=depth.get(host, 0) + 1,
+                source=["synthetic"],
+                crossed_out=True,
+            )
+        )
     for t in sc.texts:
-        g.texts.append(TextItem(id=t.id, text=t.text, bbox=_tx_box(M, t.box), crossed_out=t.crossed_out, source=["synthetic"], placement=TextPlacement.FREE))
+        src = ["synthetic", "para"] if t.kind == "para" else ["synthetic", "label"]
+        g.texts.append(TextItem(id=t.id, text=t.text, bbox=_tx_box(M, t.box), crossed_out=t.crossed_out, source=src, placement=TextPlacement.FREE))
     for c in sc.conns:
         path = _tx(M, c.path)
         eps = []
@@ -710,8 +725,29 @@ def build_ground_truth(sc: SceneBuilder, M: np.ndarray, size: tuple[int, int], i
     overlaps, touches = shape_pairs_overlap(g, sc.sw * scale)
     build_relations(g, overlaps, touches)
     g.notes.append(f"synthetic: text_height={th:.1f}px stroke={sc.sw * scale:.2f}px two_page={sc.two_page} {info}")
-    g.summary = f"Synthetic hand drawing with {len(sc.shapes)} shapes, {len(sc.conns)} connections and {len(sc.texts)} text items."
+    g.image.content_rotation = int(info.get("rotated", 0))
+    g.summary = _summary(g)
     return g
+
+
+def _summary(g: DiagramGraph) -> str:
+    """A factual one-sentence description (also the 'summary' target for VLM fine-tuning)."""
+    kinds: dict[str, int] = {}
+    for s in g.shapes:
+        if s.type != ShapeType.SCRIBBLE:
+            kinds[s.type.value] = kinds.get(s.type.value, 0) + 1
+    parts = [f"{n} {k.replace('_', ' ')}{'s' if n > 1 else ''}" for k, n in sorted(kinds.items())]
+    depth = max((s.depth for s in g.shapes), default=0)
+    labels = [t.text for t in g.texts if "label" in t.source and t.text][:6]
+    out = "Hand drawing with " + (", ".join(parts) if parts else "no closed shapes")
+    if depth:
+        out += f", nested {depth + 1} levels deep"
+    if g.connections:
+        heavy = sum(1 for c in g.connections if c.heavy)
+        out += f", {len(g.connections)} connecting line{'s' if len(g.connections) > 1 else ''}" + (f" ({heavy} heavy)" if heavy else "")
+    if labels:
+        out += "; labels include " + ", ".join(f'"{x}"' for x in labels)
+    return out + "."
 
 
 def generate_sample(seed: int, cfg: SynthConfig | None = None) -> tuple[np.ndarray, DiagramGraph]:

@@ -215,12 +215,9 @@ def cmd_config(args) -> int:
 
 
 def cmd_fonts(args) -> int:
-    import runpy
+    from .synthetic.fonts import download_fonts
 
-    script = Path(__file__).resolve().parent.parent / "scripts" / "download_fonts.py"
-    sys.argv = [str(script), "--out", args.out]
-    runpy.run_path(str(script), run_name="__main__")
-    return 0
+    return download_fonts(args.out)
 
 
 def build_parser() -> argparse.ArgumentParser:

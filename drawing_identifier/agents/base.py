@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -12,6 +13,8 @@ from ..config import AppConfig
 from ..schema import DiagramGraph, TraceEvent
 from ..vision.preprocess import Preprocessed
 from ..vlm.base import VLMBackend
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -84,6 +87,8 @@ class Agent:
     provides: ClassVar[tuple[str, ...]] = ()
     uses_vlm: ClassVar[bool] = False
     needs_vlm: ClassVar[bool] = False  # cannot do anything useful without one
+    # facts produced by later agents that become stale when this agent changes the blackboard
+    invalidates: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, config: AppConfig, vlm: VLMBackend | None = None):
         self.config = config
@@ -100,13 +105,18 @@ class Agent:
         if not self.can_run():
             rep = AgentReport(self.name, "skipped: no VLM configured", skipped=True)
         else:
-            rep = self.run(ctx, **params)
+            try:
+                rep = self.run(ctx, **params)
+            except Exception as e:  # one misbehaving agent (or VLM answer) must not abort the analysis
+                log.exception("agent %s failed", self.name)
+                rep = AgentReport(self.name, f"failed: {e.__class__.__name__}: {e}"[:300], skipped=True)
         rep.seconds = time.time() - t0
         ctx.reports.append(rep)
         ctx.log(self.name, rep.summary, rep.seconds, **{k: v for k, v in rep.data.items() if _jsonable(v)})
-        for p in self.provides:
-            if not rep.skipped:
-                ctx.facts.add(p)
+        if not rep.skipped:
+            stale = rep.data.get("invalidates")
+            ctx.facts -= set(self.invalidates if stale is None else stale)
+            ctx.facts.update(self.provides)
         return rep
 
     def run(self, ctx: AnalysisContext, **params: Any) -> AgentReport:  # pragma: no cover - abstract

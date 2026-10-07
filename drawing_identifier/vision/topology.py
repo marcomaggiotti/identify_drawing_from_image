@@ -70,7 +70,10 @@ def shape_pairs_overlap(g: DiagramGraph, sw: float) -> tuple[list[tuple[str, str
             a.add(p)
             p = by_id[p].parent_id if p in by_id else None
         ancestors[s.id] = a
-    trees = {s.id: cKDTree(np.asarray(s.polygon)) for s in g.shapes if len(s.polygon) >= 3}
+    # densified outlines: simplified polygons have few vertices along long straight edges
+    step = max(1.0, sw)
+    dense = {s.id: resample_polyline(list(s.polygon) + [s.polygon[0]], step) for s in g.shapes if len(s.polygon) >= 3}
+    trees = {sid: cKDTree(p) for sid, p in dense.items()}
     overlaps, touches = [], []
     ids = list(masks)
     for i, a in enumerate(ids):
@@ -85,15 +88,17 @@ def shape_pairs_overlap(g: DiagramGraph, sw: float) -> tuple[list[tuple[str, str
             if smaller and inter / smaller > 0.03:
                 overlaps.append((a, b))
                 continue
-            d, _ = trees[a].query(np.asarray(sb.polygon), k=1)
+            d, _ = trees[a].query(dense[b], k=1)
             if len(d) and float(d.min()) <= 2.0 * sw + 1:
                 touches.append((a, b))
     return overlaps, touches
 
 
 def place_texts(g: DiagramGraph, text_h: float, near_scale: float = 2.5) -> None:
-    """inside = innermost shape containing the text centre; near = shapes whose outline is close."""
-    contours = {s.id: _contour(s.polygon) for s in g.shapes if len(s.polygon) >= 3}
+    """inside = innermost shape containing the text centre; near = shapes whose outline is close.
+
+    Scribbles are marks over a shape, not containers, so they never hold text."""
+    contours = {s.id: _contour(s.polygon) for s in g.shapes if len(s.polygon) >= 3 and s.type != ShapeType.SCRIBBLE}
     areas = {s.id: _shape_area(s) for s in g.shapes}
     near_d = near_scale * text_h
     for s in g.shapes:

@@ -464,13 +464,23 @@ def detect_shapes(ink: np.ndarray, params: ShapeDetectorParams) -> list[ShapeCan
         # union of overlapping shapes that were already found (Venn diagrams)
         x0, y0, x1, y1 = c.roi
         union = np.zeros(c.mask.shape, bool)
+        pieces = []  # accepted candidates lying (almost) entirely inside c
         for a in accepted:
             ax0, ay0, ax1, ay1 = a.roi
             ix0, iy0, ix1, iy1 = max(x0, ax0), max(y0, ay0), min(x1, ax1), min(y1, ay1)
             if ix1 > ix0 and iy1 > iy0:
-                union[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0] |= a.mask[iy0 - ay0 : iy1 - ay0, ix0 - ax0 : ix1 - ax0]
+                part = a.mask[iy0 - ay0 : iy1 - ay0, ix0 - ax0 : ix1 - ax0]
+                union[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0] |= part
+                inside = np.count_nonzero(part & c.mask[iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0])
+                if inside >= 0.9 * max(1, np.count_nonzero(a.mask)):
+                    pieces.append(a)
         if union.any() and _iou(union, c.mask) > 0.8:
-            continue
+            # genuine Venn pieces fit better than their union; partial pieces of one outline (cut into
+            # more parts than max_merge) fit worse than the whole outline, which then replaces them
+            if pieces and c.fit.score > max(a.fit.score for a in pieces) + 0.02:
+                accepted = [a for a in accepted if not any(a is p for p in pieces)]
+            else:
+                continue
         accepted.append(c)
 
     covered = set().union(*[a.holes for a in accepted]) if accepted else set()

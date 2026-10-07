@@ -84,6 +84,20 @@ def detector_objects(g: DiagramGraph) -> list[dict]:
     return objs
 
 
+def vlm_view(g: DiagramGraph) -> DiagramGraph:
+    """What the analysis prompt asks the VLM to report: running prose that is neither inside
+    nor next to a shape (nor a line label/end) is left out, as the prompt says to ignore it."""
+    used = {ep.text_id for c in g.connections for ep in c.endpoints if ep.text_id}
+    keep = [
+        t
+        for t in g.texts
+        if "para" not in t.source or t.inside_shape_id or t.near_shape_ids or t.connection_id or t.id in used
+    ]
+    v = g.model_copy(deep=True)
+    v.texts = [t.model_copy(deep=True) for t in keep]
+    return v
+
+
 def _yolo_lines(objs: list[dict], w: int, h: int) -> list[str]:
     lines = []
     for o in objs:
@@ -127,7 +141,7 @@ def _one(args) -> dict:
             for o in objs
         ]
     if "vlm" in formats:
-        target = graph_to_vlm_target(g)
+        target = graph_to_vlm_target(vlm_view(g))
         rec["vlm"] = {
             "id": name,
             "images": [g.image.path],
@@ -147,6 +161,11 @@ def _one(args) -> dict:
             crop = img[max(0, y0 - pad) : min(h, y1 + pad), max(0, x0 - pad) : min(w, x1 + pad)]
             if crop.size == 0 or crop.shape[0] < 4 or crop.shape[1] < 4:
                 continue
+            # undo a 90-degree page rotation so the handwriting in the crop is upright
+            if g.image.content_rotation == 90:
+                crop = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            elif g.image.content_rotation == 270:
+                crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
             fn = f"{name}_{t.id}.png"
             cv2.imwrite(str(out / "ocr" / split / fn), crop)
             rows.append(f"{split}/{fn}\t{t.text}\t{int(t.crossed_out)}")
@@ -176,7 +195,7 @@ def generate_dataset(
             (out / "labels" / split).mkdir(parents=True, exist_ok=True)
         if "ocr" in formats:
             (out / "ocr" / split).mkdir(parents=True, exist_ok=True)
-    n_val = int(round(n * val_fraction))
+    n_val = max(1, int(round(n * val_fraction))) if (n > 1 and val_fraction > 0) else 0
     jobs = [(i + 1, seed * 1_000_003 + i, "val" if i < n_val else "train", str(out), formats, asdict(cfg)) for i in range(n)]
     workers = workers or max(1, min(8, (os.cpu_count() or 2)))
     recs: list[dict] = []
@@ -195,8 +214,9 @@ def generate_dataset(
 
     if "yolo" in formats:
         names = "\n".join(f"  {i}: {c}" for i, c in enumerate(DETECTOR_CLASSES))
+        val_dir = "images/val" if n_val else "images/train"
         (out / "data.yaml").write_text(
-            f"# synthetic hand-drawn diagrams (drawing_identifier)\npath: {out.resolve()}\ntrain: images/train\nval: images/val\nnames:\n{names}\n",
+            f"# synthetic hand-drawn diagrams (drawing_identifier)\npath: {out.resolve()}\ntrain: images/train\nval: {val_dir}\nnames:\n{names}\n",
             encoding="utf-8",
         )
     for split in ("train", "val"):

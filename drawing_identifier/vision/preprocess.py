@@ -26,8 +26,16 @@ ROTATIONS = {
 def load_image(path: str) -> np.ndarray:
     """Load any PIL-readable file (jpg/png/webp/tiff...) as a BGR uint8 array."""
     with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im).convert("RGB")
-        arr = np.asarray(im)
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "PA") or (im.mode == "P" and "transparency" in im.info):
+            # transparent background -> white paper, not black
+            im = im.convert("RGBA")
+            im = Image.alpha_composite(Image.new("RGBA", im.size, (255, 255, 255, 255)), im)
+        if im.mode in ("I;16", "I", "F"):
+            a = np.asarray(im, dtype=np.float64)
+            a = 255.0 * (a - a.min()) / max(1e-9, a.max() - a.min())
+            im = Image.fromarray(a.astype(np.uint8))
+        arr = np.asarray(im.convert("RGB"))
     return np.ascontiguousarray(arr[:, :, ::-1])
 
 
@@ -44,7 +52,7 @@ def ink_gray(bgr: np.ndarray) -> np.ndarray:
     """
     if bgr.ndim == 2:
         return bgr.copy()
-    return bgr.max(axis=2)
+    return bgr[:, :, :3].max(axis=2)
 
 
 def find_page(gray: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -105,17 +113,20 @@ def remove_specks(ink: np.ndarray, min_area: int) -> np.ndarray:
     return keep[lab]
 
 
-def remove_ruled_lines(ink: np.ndarray, frac: float = 0.33, max_thickness: float = 4.0) -> tuple[np.ndarray, np.ndarray]:
+def remove_ruled_lines(ink: np.ndarray, frac: float = 0.33, max_thickness: float = 4.0, page_span: float = 0.7) -> tuple[np.ndarray, np.ndarray]:
     """Remove long, perfectly straight, thin horizontal/vertical rules (ruled paper, gutters, frames).
 
-    Heavy hand-drawn lines (thicker than ``max_thickness``) are kept, and strokes that
-    cross a removed rule are re-joined so shapes drawn over ruled paper stay closed.
+    A straight run counts as a rule when it spans most of the page (``page_span``), or when it
+    is at least ``frac`` long *and* stands alone (its ink is not joined to other strokes, unlike
+    the side of a drawn rectangle). Heavy lines (thicker than ``max_thickness``) are kept, and
+    strokes crossing a removed rule are re-joined so shapes drawn over ruled paper stay closed.
     """
     h, w = ink.shape
     u8 = ink.astype(np.uint8)
     out = ink.copy()
     rules = np.zeros_like(ink)
     t = max(1, int(round(max_thickness)))
+    n_ink, ink_lab, ink_st, _ = cv2.connectedComponentsWithStats(u8, connectivity=8)
     for horizontal in (True, False):
         k = (max(10, int(w * frac)), 1) if horizontal else (1, max(10, int(h * frac)))
         line = cv2.morphologyEx(u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, k)) > 0
@@ -125,6 +136,24 @@ def remove_ruled_lines(ink: np.ndarray, frac: float = 0.33, max_thickness: float
         across = (1, t + 1) if horizontal else (t + 1, 1)
         thick = cv2.morphologyEx(u8, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, across)) > 0
         line &= ~thick
+        # keep only runs that look like page furniture
+        n, lab, st, _ = cv2.connectedComponentsWithStats(line.astype(np.uint8), connectivity=8)
+        keep = np.zeros(n, bool)
+        for i in range(1, n):
+            x, y, bw, bh, _ = st[i]
+            length = bw if horizontal else bh
+            span = length / float(w if horizontal else h)
+            if span >= page_span:
+                keep[i] = True
+                continue
+            ids = np.unique(ink_lab[lab == i])
+            ids = ids[ids > 0]
+            perp = max((ink_st[j, cv2.CC_STAT_HEIGHT] if horizontal else ink_st[j, cv2.CC_STAT_WIDTH]) for j in ids) if len(ids) else 0
+            keep[i] = perp <= 3 * t + 2  # nothing else hangs off it
+        keep[0] = False
+        line = keep[lab]
+        if not line.any():
+            continue
         line = cv2.dilate(line.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         line &= ink
         removed = out & ~line
@@ -137,15 +166,18 @@ def remove_ruled_lines(ink: np.ndarray, frac: float = 0.33, max_thickness: float
 
 def stroke_width(ink: np.ndarray) -> tuple[float, float]:
     """(median stroke width, 90th percentile stroke width) in pixels."""
-    if ink.sum() < 20:
+    if ink.sum() < 20 or ink.mean() > 0.5:
         return 2.0, 3.0
     dist = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 5)
     skel = skeletonize(ink)
     vals = dist[skel]
     if len(vals) == 0:
         return 2.0, 3.0
-    med = max(1.5, 2.0 * float(np.median(vals)) - 1.0)
-    p90 = max(med, 2.0 * float(np.percentile(vals, 90)) - 1.0)
+    cap = max(4.0, 0.02 * max(ink.shape))
+    med = float(np.clip(2.0 * float(np.median(vals)) - 1.0, 1.5, cap))
+    p90 = float(np.clip(2.0 * float(np.percentile(vals, 90)) - 1.0, med, cap))
+    if not (np.isfinite(med) and np.isfinite(p90)):
+        return 2.0, 3.0
     return med, p90
 
 
@@ -238,6 +270,10 @@ def preprocess(
     def _ink_of(img):
         g = flatten_background(ink_gray(img))
         ink = binarize(g)
+        if ink.mean() > 0.5:
+            # negative scan (light lines on a dark ground): invert and start again
+            g = flatten_background(255 - ink_gray(img))
+            ink = binarize(g)
         ink = remove_specks(ink, 6)
         rules = None
         if remove_rules:

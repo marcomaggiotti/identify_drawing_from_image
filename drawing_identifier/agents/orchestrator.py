@@ -107,6 +107,26 @@ class AnalysisResult:
         return {k: str(v) for k, v in paths.items()}
 
 
+def normalize_array(image: np.ndarray) -> np.ndarray:
+    """Any numpy image (gray, (H,W,1), BGRA, float 0..1 / 0..255, uint16) -> uint8 BGR."""
+    img = np.asarray(image)
+    if img.ndim == 3 and img.shape[2] == 1:
+        img = img[:, :, 0]
+    if img.dtype != np.uint8:
+        f = img.astype(np.float64)
+        if np.issubdtype(img.dtype, np.floating) and f.size and np.nanmax(f) <= 1.0:
+            f = f * 255.0
+        elif img.dtype == np.uint16:
+            f = f / 257.0
+        img = np.clip(np.nan_to_num(f), 0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        a = img[:, :, 3:4].astype(np.float32) / 255.0
+        return (img[:, :, :3].astype(np.float32) * a + 255.0 * (1.0 - a)).astype(np.uint8)
+    return np.ascontiguousarray(img[:, :, :3])
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -139,9 +159,7 @@ class Orchestrator:
             source = source or str(image)
             img = load_image(str(image))
         else:
-            img = np.asarray(image)
-            if img.ndim == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            img = normalize_array(image)
         ctx = AnalysisContext(config=self.config, original=img, source=source)
         mode = (mode or self.config.orchestrator.mode).lower()
         if mode == "planner" and self.planner_vlm is not None:
@@ -196,19 +214,25 @@ class Orchestrator:
             self._run(ctx, "shapes", mode="merge", relax=True)
         elif r == "connections":
             self._run(ctx, "connections")
+            self._run(ctx, "text_layout")  # connectors and text share the leftover ink
         elif r == "text_reader" and self.agents["text_reader"].can_run():
             self._run(ctx, "text_reader", force=True)
         self._run(ctx, "topology")
 
     def _default_next(self, ctx: AnalysisContext) -> str | None:
+        gave_up = {r.agent for r in ctx.reports if r.skipped}  # skipped/failed once: do not insist
         for name in PIPELINE:
             a = self.agents[name]
+            if name in gave_up:
+                continue
             if a.ready(ctx) and a.can_run() and not all(p in ctx.facts for p in a.provides):
                 return name
         if "topology" not in ctx.facts and self.agents["topology"].ready(ctx):
             return "topology"
         v = self.agents["verifier"]
         runs = sum(1 for r in ctx.reports if r.agent == "verifier")
+        if "verifier" in gave_up:
+            return None
         if v.ready(ctx) and v.can_run() and self.config.verifier.enabled and "verified" not in ctx.facts and runs < self.config.verifier.max_rounds:
             return "verifier"
         return None
@@ -248,7 +272,8 @@ class Orchestrator:
                     break
                 action = None
             agent = self.agents.get(action or "")
-            if agent is None or not agent.ready(ctx) or not agent.can_run() or last[-2:] == [action, action]:
+            gave_up = {r.agent for r in ctx.reports if r.skipped}
+            if agent is None or not agent.ready(ctx) or not agent.can_run() or action in gave_up or last[-2:] == [action, action]:
                 fallback = self._default_next(ctx)
                 if action:
                     ctx.log("planner", f"rejected action {action!r}; falling back to {fallback!r}")

@@ -74,7 +74,9 @@ def parse_spec(spec: str) -> tuple[str, VLMProfile]:
         raise ValueError(f"unknown VLM provider {raw_provider!r}; known: {sorted(set(PROVIDER_ALIASES))}")
     if base_url is None:
         base_url = DEFAULT_BASE_URLS.get(raw_provider.lower())
-    extra = {}
+    extra: dict = {}
+    if raw_provider.lower() == "lmstudio":
+        extra["json_mode"] = False  # LM Studio rejects response_format={"type": "json_object"}
     max_images = 8
     if provider == "ollama" and any(k in model for k in ("llama3.2-vision", "llava")):
         max_images = 1

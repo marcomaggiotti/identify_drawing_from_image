@@ -27,9 +27,15 @@ class PreprocessAgent(Agent):
     description = "Crop the page from the scanner frame, fix orientation (asks the VLM when unsure), flatten the background and binarise the ink."
     provides = ("preprocessed",)
     uses_vlm = True
+    invalidates = ("triaged", "shapes", "connections", "text_regions", "topology", "vlm_analysis", "text_read", "verified")
 
     def run(self, ctx: AnalysisContext, rotation: int | None = None, **_: Any) -> AgentReport:
         cfg = self.config.preprocess
+        # a new working image invalidates every coordinate on the blackboard
+        g = ctx.graph
+        g.shapes, g.connections, g.texts, g.relations = [], [], [], []
+        ctx.artifacts.clear()
+        ctx.text_height = None
         fixed: int | None = rotation
         if fixed is None and str(cfg.orientation).lower() not in ("auto",):
             fixed = 0 if str(cfg.orientation).lower() == "none" else int(cfg.orientation)
@@ -151,6 +157,7 @@ class ShapeDetectionAgent(Agent):
     description = "Find closed hand-drawn shapes and classify them (ellipse, circle, rectangle, rounded rectangle, triangle, diamond, polygon, irregular region) with classical CV and, if configured, the locally trained detector."
     requires = ("preprocessed",)
     provides = ("shapes",)
+    invalidates = ("connections", "text_regions", "topology", "verified")
 
     def __init__(self, config, vlm=None):
         super().__init__(config, vlm)
@@ -172,12 +179,13 @@ class ShapeDetectionAgent(Agent):
         params = ShapeDetectorParams(
             stroke_width=prep.stroke_width,
             heavy_width=prep.heavy_width,
-            min_shape_scale=float(overrides.get("min_shape_scale", cfg.min_shape_scale)),
-            gap_close_scale=float(overrides.get("gap_close_scale", cfg.gap_close_scale)),
-            fit_threshold=float(overrides.get("fit_threshold", cfg.fit_threshold)),
+            min_shape_scale=_num(overrides.get("min_shape_scale"), cfg.min_shape_scale, 1.0, 50.0),
+            gap_close_scale=_num(overrides.get("gap_close_scale"), cfg.gap_close_scale, 0.5, 10.0),
+            fit_threshold=_num(overrides.get("fit_threshold"), cfg.fit_threshold, 0.5, 0.99),
             keep_subregions=cfg.keep_subregions,
             max_merge=cfg.max_merge,
         )
+        relax = _flag(relax)
         if relax:
             params.min_shape_scale *= 0.7
             params.gap_close_scale *= 1.6
@@ -225,7 +233,9 @@ class ShapeDetectionAgent(Agent):
                         Shape(id="", type=ShapeType(d["class"]), bbox=b.round(), polygon=[tuple(p) for p in poly], confidence=round(d["conf"], 3), source=["yolo"])
                     )
         g = ctx.graph
+        stale = None
         if mode == "merge":
+            stale = ["topology", "verified"]  # existing connections/texts stay valid
             added = 0
             for s in shapes:
                 if all(_iou_xyxy(s.bbox.xyxy, o.bbox.xyxy) < 0.5 for o in g.shapes):
@@ -244,7 +254,25 @@ class ShapeDetectionAgent(Agent):
             )
         if n_local:
             summary += f" (local detector: {n_local} detections)"
-        return AgentReport(self.name, summary, {"n_shapes": len(g.shapes)})
+        data: dict[str, Any] = {"n_shapes": len(g.shapes)}
+        if stale is not None:
+            data["invalidates"] = stale
+        return AgentReport(self.name, summary, data)
+
+
+def _num(v: Any, default: float, lo: float, hi: float) -> float:
+    """Numeric override coming from a planner VLM: fall back to the default when unusable."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return float(default)
+    return float(min(hi, max(lo, x))) if x == x else float(default)
+
+
+def _flag(v: Any) -> bool:
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "yes", "1", "y")
+    return bool(v)
 
 
 def _count(items) -> dict:
@@ -260,6 +288,7 @@ class ConnectionAgent(Agent):
     description = "Trace lines, arrows and heavy lines of identity between shapes and labels (erasing outlines first, re-joining lines cut at outlines)."
     requires = ("shapes",)
     provides = ("connections",)
+    invalidates = ("text_regions", "topology", "verified")
 
     def run(self, ctx: AnalysisContext, **_: Any) -> AgentReport:
         prep = ctx.prep
@@ -306,6 +335,7 @@ class TextLayoutAgent(Agent):
     description = "Group the remaining ink into words / text lines and locate them (does not read them)."
     requires = ("connections",)
     provides = ("text_regions",)
+    invalidates = ("text_read", "topology", "verified")
 
     def run(self, ctx: AnalysisContext, **_: Any) -> AgentReport:
         text_mask = ctx.artifacts.get("text_mask")
@@ -314,6 +344,7 @@ class TextLayoutAgent(Agent):
         blobs, th = group_text(text_mask, ctx.artifacts.get("ring"), ctx.prep.stroke_width)
         ctx.text_height = th
         g = ctx.graph
+        previous = [t for t in g.texts if "cv" in t.source]
         g.texts = [t for t in g.texts if "cv" not in t.source]
         for b in blobs:
             x0, y0, x1, y1 = b.bbox
@@ -321,7 +352,12 @@ class TextLayoutAgent(Agent):
             # an existing (VLM) text at the same spot keeps its transcription
             if any(t.bbox.iou(box) > 0.5 for t in g.texts):
                 continue
-            g.texts.append(TextItem(id=g.next_id("T"), bbox=box, confidence=0.5, source=["cv"]))
+            item = TextItem(id=g.next_id("T"), bbox=box, confidence=0.5, source=["cv"])
+            # on a re-run, keep what was already read for the same region
+            old = max(previous, key=lambda t: t.bbox.iou(box), default=None)
+            if old is not None and old.text and old.bbox.iou(box) > 0.6:
+                item.text, item.confidence, item.crossed_out, item.source = old.text, old.confidence, old.crossed_out, list(old.source)
+            g.texts.append(item)
         return AgentReport(self.name, f"{len(blobs)} text region(s), text height ~{th:.0f}px", {"n_texts": len(blobs), "text_height": th})
 
 

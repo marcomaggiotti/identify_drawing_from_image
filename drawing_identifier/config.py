@@ -91,11 +91,17 @@ class AppConfig(BaseModel):
         return self.agent_vlms.get(agent, self.default_vlm)
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
+def _deep_merge(base: dict, override: dict, _key: str | None = None) -> dict:
+    """Recursive merge. A VLM profile redefined with another provider/base_url replaces the old one
+    entirely, so stale fields (api_key_env, extra.adapter_path...) do not leak into it."""
     out = copy.deepcopy(base)
     for k, v in (override or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict) and k != "agent_vlms":
-            out[k] = _deep_merge(out[k], v)
+        old = out.get(k)
+        if _key == "vlms" and isinstance(v, dict) and isinstance(old, dict):
+            same = v.get("provider", old.get("provider")) == old.get("provider") and v.get("base_url", old.get("base_url")) == old.get("base_url")
+            out[k] = _deep_merge(old, v) if same else copy.deepcopy(v)
+        elif isinstance(v, dict) and isinstance(old, dict):
+            out[k] = _deep_merge(old, v, k)
         else:
             out[k] = copy.deepcopy(v)
     return out

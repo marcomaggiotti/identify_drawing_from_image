@@ -84,7 +84,9 @@ def analyse_skeleton(skel: np.ndarray, offset=(0, 0), sw: float = 2.0) -> dict:
     skel = skel.copy()
     ox, oy = offset
     spur = max(3, int(round(1.5 * sw)) + 1)
-    barb_max = max(8, int(round(6 * sw)))
+    ys_, xs_ = np.nonzero(skel)
+    extent = max(int(xs_.max() - xs_.min()), int(ys_.max() - ys_.min())) if len(xs_) else 0
+    barb_max = max(8, int(round(6 * sw)), int(0.15 * extent))
     heads: list[tuple[int, int]] = []
 
     def walk_from(ep, deg):
@@ -117,11 +119,11 @@ def analyse_skeleton(skel: np.ndarray, offset=(0, 0), sw: float = 2.0) -> dict:
             pix, j = walk_from((int(x), int(y)), deg)
             if j is not None:
                 branches.append((pix, j))
-        # arrow heads: >=2 short barbs meeting at one junction region
-        by_j: dict[tuple[int, int], list] = {}
+        # arrow heads: >=2 short barbs meeting at the same junction cluster
+        jl = cv2.connectedComponents(cv2.dilate((deg >= 3).astype(np.uint8), np.ones((3, 3), np.uint8)), connectivity=8)[1]
+        by_j: dict[int, list] = {}
         for pix, j in branches:
-            key = (j[0] // 3, j[1] // 3)
-            by_j.setdefault(key, []).append((pix, j))
+            by_j.setdefault(int(jl[j[1], j[0]]), []).append((pix, j))
         removed = False
         total = int(skel.sum())
         for key, lst in by_j.items():
@@ -151,8 +153,10 @@ def analyse_skeleton(skel: np.ndarray, offset=(0, 0), sw: float = 2.0) -> dict:
     a, _, _ = _bfs_far(pts, start)
     b, dist, prev = _bfs_far(pts, a)
     path = _path_to(prev, b)
-    if not endpoints:
-        endpoints = [a, b]
+    # the ends of the longest path are line ends even when pruning left a tiny junction knot there
+    for q in (a, b):
+        if all((q[0] - e[0]) ** 2 + (q[1] - e[1]) ** 2 > (2 * sw) ** 2 for e in endpoints):
+            endpoints.append(q)
     # arrow heads collapse into the endpoint nearest to them
     head_pts = []
     for h in heads:

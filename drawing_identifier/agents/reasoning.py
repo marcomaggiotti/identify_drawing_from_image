@@ -19,6 +19,8 @@ from ..prompts import (
     from_model_box,
     graph_to_vlm_target,
     parse_vlm_graph,
+    _as_bool,
+    _ref,
     _shape_type,
 )
 from ..schema import (
@@ -71,7 +73,8 @@ class TextReaderAgent(Agent):
 
     def run(self, ctx: AnalysisContext, force: bool = False, ids: list[str] | None = None, **_: Any) -> AgentReport:
         g = ctx.graph
-        todo = [t for t in g.texts if (force or not t.text or t.confidence < 0.5)]
+        # a forced re-read never overwrites transcriptions the verifier corrected
+        todo = [t for t in g.texts if (force and "verifier" not in t.source) or not t.text or t.confidence < 0.5]
         if ids:
             todo = [t for t in g.texts if t.id in set(ids)]
         prio = {TextPlacement.INSIDE: 0, TextPlacement.NEAR: 1, TextPlacement.ON_LINE: 1, TextPlacement.FREE: 2}
@@ -91,14 +94,19 @@ class TextReaderAgent(Agent):
         n = 0
         for t in todo:
             r = results.get(t.id)
-            if not r:
+            if not isinstance(r, dict):
                 continue
-            txt = str(r.get("text", "")).strip()
+            raw_txt = r.get("text")
+            txt = "" if raw_txt is None else str(raw_txt).strip()
             if txt:
                 t.text = txt
                 n += 1
-            t.crossed_out = bool(r.get("crossed_out", t.crossed_out))
-            t.confidence = round(float(r.get("confidence", 0.7) or 0.7), 3)
+            t.crossed_out = bool(_as_bool(r.get("crossed_out"), t.crossed_out))
+            try:
+                conf = float(r.get("confidence") or 0.7)
+            except (TypeError, ValueError):
+                conf = 0.7
+            t.confidence = round(min(1.0, max(0.0, conf)), 3)
             if mode not in t.source:
                 t.source.append(mode if mode != "vlm" else "vlm_ocr")
         return AgentReport(self.name, f"transcribed {n}/{len(todo)} text region(s) with {mode}", {"read": n, "requested": len(todo)})
@@ -200,13 +208,14 @@ class VLMAnalystAgent(Agent):
             return AgentReport(self.name, "disabled in config", skipped=True)
         g = ctx.graph
         w, h = g.image.width, g.image.height
+        fmt = self.vlm.profile.bbox_format
         try:
-            data = self.vlm.generate_json(analysis_prompt(), [ctx.image], system=SYSTEM_PROMPT, max_tokens=self.vlm.profile.max_tokens)
+            data = self.vlm.generate_json(analysis_prompt(fmt), [ctx.image], system=SYSTEM_PROMPT, max_tokens=self.vlm.profile.max_tokens)
+            vg = parse_vlm_graph(data, w, h, fmt, source="vlm", sent_size=_sent_size(self.vlm, ctx.image))
+            stats = fuse(g, vg)
         except Exception as e:
             log.warning("vlm_analyst failed: %s", e)
-            return AgentReport(self.name, f"VLM call failed: {e.__class__.__name__}", skipped=True)
-        vg = parse_vlm_graph(data, w, h, self.vlm.profile.bbox_format, source="vlm")
-        stats = fuse(g, vg)
+            return AgentReport(self.name, f"VLM answer unusable: {e.__class__.__name__}", skipped=True)
         if vg.summary:
             g.summary = vg.summary
         if g.is_drawing is None and vg.is_drawing is not None:
@@ -322,14 +331,16 @@ class VerifierAgent(Agent):
             return AgentReport(self.name, f"VLM call failed: {e.__class__.__name__}", skipped=True)
         if not isinstance(ans, dict):
             ans = {}
-        changes = apply_corrections(g, ans)
+        changes = apply_corrections(g, ans, self.vlm.profile.bbox_format, _sent_size(self.vlm, ctx.image))
         ctx.feedback.append(ans)
         if ans.get("summary"):
             g.summary = str(ans["summary"])
-        for issue in ans.get("issues", []) or []:
+        issues = ans.get("issues") or []
+        for issue in issues if isinstance(issues, list) else [issues]:
             g.notes.append(f"verifier: {issue}")
-        reruns = [r for r in (ans.get("rerun") or []) if r in ("shapes", "text_reader", "connections")]
-        complete = bool(ans.get("is_complete", not any(changes.values())))
+        rr = ans.get("rerun") or []
+        reruns = [r for r in (rr if isinstance(rr, list) else [rr]) if r in ("shapes", "text_reader", "connections")]
+        complete = bool(_as_bool(ans.get("is_complete"), not any(changes.values())))
         ctx.facts.add("verifier_ran")
         if complete:
             ctx.facts.add("verified")
@@ -341,22 +352,57 @@ class VerifierAgent(Agent):
             self.name,
             f"{'complete' if complete else 'needs work'}; applied {changed or 'no changes'}"
             + (f"; re-run requested: {reruns}" if reruns else ""),
-            {"is_complete": complete, **changes, "rerun": reruns},
+            {"is_complete": complete, **changes, "rerun": reruns, "invalidates": ["topology"] if any(changes.values()) else []},
         )
 
 
-def apply_corrections(g: DiagramGraph, ans: dict) -> dict[str, int]:
+def _as_list(v: Any) -> list:
+    return v if isinstance(v, list) else ([] if v in (None, "", {}) else [v])
+
+
+def _as_dict(v: Any) -> dict:
+    return v if isinstance(v, dict) else {}
+
+
+def _drop_dangling(g: DiagramGraph) -> None:
+    sids = {s.id for s in g.shapes}
+    tids = {t.id for t in g.texts}
+    for s in g.shapes:
+        if s.parent_id not in sids:
+            s.parent_id = None
+    for t in g.texts:
+        if t.inside_shape_id not in sids:
+            t.inside_shape_id = None
+        t.near_shape_ids = [x for x in t.near_shape_ids if x in sids]
+    for c in g.connections:
+        for ep in c.endpoints:
+            if ep.shape_id and ep.shape_id not in sids:
+                ep.shape_id = None
+            if ep.text_id and ep.text_id not in tids:
+                ep.text_id = None
+
+
+def apply_corrections(g: DiagramGraph, ans: dict, bbox_format: str = "xyxy_1000", sent_size: tuple[int, int] | None = None) -> dict[str, int]:
+    """Apply a verifier answer to the graph. Malformed fields are ignored, never fatal."""
     w, h = g.image.width, g.image.height
     ch = dict(removed_shapes=0, retyped=0, added_shapes=0, text_fixed=0, removed_texts=0, removed_conns=0, added_conns=0)
-    rm = {str(x) for x in ans.get("remove_shapes", []) or []}
+    rm = {r for r in (_ref(x) for x in _as_list(ans.get("remove_shapes"))) if r}
     if rm:
         before = len(g.shapes)
         g.shapes = [s for s in g.shapes if s.id not in rm]
         ch["removed_shapes"] = before - len(g.shapes)
-        for s in g.shapes:
-            if s.parent_id in rm:
-                s.parent_id = None
-    for sid, typ in (ans.get("retype_shapes") or {}).items():
+    rt = {r for r in (_ref(x) for x in _as_list(ans.get("remove_texts"))) if r}
+    if rt:
+        before = len(g.texts)
+        g.texts = [t for t in g.texts if t.id not in rt]
+        ch["removed_texts"] = before - len(g.texts)
+    rc = {r for r in (_ref(x) for x in _as_list(ans.get("remove_connections"))) if r}
+    if rc:
+        before = len(g.connections)
+        g.connections = [c for c in g.connections if c.id not in rc]
+        ch["removed_conns"] = before - len(g.connections)
+    _drop_dangling(g)  # before anything new is added, so no reference can latch onto a new element
+    for sid, typ in _as_dict(ans.get("retype_shapes")).items():
         s = g.shape(str(sid))
         st = _shape_type(typ)
         if s is not None and st != ShapeType.UNKNOWN and st != s.type:
@@ -365,37 +411,27 @@ def apply_corrections(g: DiagramGraph, ans: dict) -> dict[str, int]:
             if "verifier" not in s.source:
                 s.source.append("verifier")
             ch["retyped"] += 1
-    for raw in ans.get("add_shapes", []) or []:
+    for raw in _as_list(ans.get("add_shapes")):
         if not isinstance(raw, dict):
             continue
-        b = from_model_box(raw.get("bbox"), w, h)
+        b = from_model_box(raw.get("bbox"), w, h, bbox_format, sent_size)
         if b is None or any(s.bbox.iou(b) > 0.5 for s in g.shapes):
             continue
         st = _shape_type(raw.get("type"))
         g.shapes.append(Shape(id=g.next_id("S"), type=st, bbox=b.round(), polygon=bbox_polygon(b, st), confidence=0.5, source=["verifier"]))
         ch["added_shapes"] += 1
-    for tid, txt in (ans.get("text_corrections") or {}).items():
+    for tid, txt in _as_dict(ans.get("text_corrections")).items():
         t = g.text(str(tid))
-        if t is not None and isinstance(txt, str) and txt.strip() and txt != t.text:
-            t.text = txt.strip()
+        if t is not None and isinstance(txt, (str, int, float)) and str(txt).strip() and str(txt).strip() != t.text:
+            t.text = str(txt).strip()
             t.confidence = 0.8
             if "verifier" not in t.source:
                 t.source.append("verifier")
             ch["text_fixed"] += 1
-    rt = {str(x) for x in ans.get("remove_texts", []) or []}
-    if rt:
-        before = len(g.texts)
-        g.texts = [t for t in g.texts if t.id not in rt]
-        ch["removed_texts"] = before - len(g.texts)
-    rc = {str(x) for x in ans.get("remove_connections", []) or []}
-    if rc:
-        before = len(g.connections)
-        g.connections = [c for c in g.connections if c.id not in rc]
-        ch["removed_conns"] = before - len(g.connections)
-    for raw in ans.get("add_connections", []) or []:
+    for raw in _as_list(ans.get("add_connections")):
         if not isinstance(raw, dict):
             continue
-        ends = [str(e) for e in raw.get("ends", []) if e]
+        ends = [r for r in (_ref(e) for e in _as_list(raw.get("ends"))) if r]
         items = [(e, g.text(e) or g.shape(e)) for e in ends]
         items = [(e, it) for e, it in items if it is not None]
         if len(items) < 2:
@@ -406,22 +442,23 @@ def apply_corrections(g: DiagramGraph, ans: dict) -> dict[str, int]:
                 text_id=e if isinstance(it, TextItem) else None,
                 shape_id=e if isinstance(it, Shape) else None,
                 attachment="text" if isinstance(it, TextItem) else "boundary",
+                is_head=(str(raw.get("type", "")) == "arrow" and k == len(items) - 1),
             )
-            for e, it in items
+            for k, (e, it) in enumerate(items)
         ]
         ctype = ConnectionType.ARROW if str(raw.get("type", "line")) == "arrow" else ConnectionType.LINE
         g.connections.append(
             Connection(id=g.next_id("C"), type=ctype, path=[ep.point for ep in eps], endpoints=eps, confidence=0.5, source=["verifier"], attributes={"locked_ends": True})
         )
         ch["added_conns"] += 1
-    # drop dangling references
-    sids = {s.id for s in g.shapes}
-    tids = {t.id for t in g.texts}
-    for c in g.connections:
-        for ep in c.endpoints:
-            if ep.shape_id and ep.shape_id not in sids:
-                ep.shape_id = None
-            if ep.text_id and ep.text_id not in tids:
-                ep.text_id = None
     return ch
 
+
+def _sent_size(vlm, image: np.ndarray) -> tuple[int, int]:
+    """Size of the copy of ``image`` the backend actually sends (needed for pixel bbox formats)."""
+    h, w = image.shape[:2]
+    m = vlm.profile.max_image_side
+    if m and max(w, h) > m:
+        r = m / max(w, h)
+        return max(1, round(w * r)), max(1, round(h * r))
+    return w, h

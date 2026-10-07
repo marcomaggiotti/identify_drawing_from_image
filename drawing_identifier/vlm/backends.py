@@ -88,6 +88,7 @@ class OpenAIBackend(VLMBackend):
         super().__init__(profile, name)
         self.compatible = compatible
         self._client = None
+        self._no_json_mode = False
 
     def is_available(self) -> tuple[bool, str]:
         try:
@@ -132,14 +133,28 @@ class OpenAIBackend(VLMBackend):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": content})
         kwargs: dict[str, Any] = {"model": self.profile.model, "messages": messages}
+        reasoning = not self.compatible and self.profile.model.startswith(("gpt-5", "o1", "o3", "o4"))
+        if reasoning:
+            # hidden reasoning tokens count against max_completion_tokens: keep effort low and leave headroom
+            kwargs["reasoning_effort"] = self.profile.extra.get("reasoning_effort", "minimal")
+            max_tokens = max(max_tokens, int(self.profile.extra.get("min_completion_tokens", 4096)))
         # api.openai.com uses max_completion_tokens; most compatible servers still use max_tokens
         kwargs["max_tokens" if self.compatible else "max_completion_tokens"] = max_tokens
         if self.profile.temperature is not None:
             kwargs["temperature"] = self.profile.temperature
-        if json_mode and self.profile.extra.get("json_mode", True):
+        if json_mode and self.profile.extra.get("json_mode", True) and not self._no_json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         kwargs.update(self.profile.extra.get("request", {}))
-        resp = self._get_client().chat.completions.create(**kwargs)
+        try:
+            resp = self._get_client().chat.completions.create(**kwargs)
+        except Exception as e:
+            # some compatible servers reject response_format=json_object: retry once without it
+            if "response_format" in kwargs and "response_format" in str(e):
+                self._no_json_mode = True
+                kwargs.pop("response_format")
+                resp = self._get_client().chat.completions.create(**kwargs)
+            else:
+                raise
         text = resp.choices[0].message.content or ""
         usage = {}
         if getattr(resp, "usage", None) is not None:
@@ -184,6 +199,11 @@ class GeminiBackend(VLMBackend):
             parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"))
         parts.append(prompt)
         cfg: dict[str, Any] = {"max_output_tokens": max_tokens}
+        if "2.5" in self.profile.model or "thinking" in self.profile.model:
+            # thinking tokens count against max_output_tokens; small answers need no thinking budget
+            budget = self.profile.extra.get("thinking_budget", 0 if "flash" in self.profile.model else 128)
+            cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=int(budget))
+            cfg["max_output_tokens"] = max_tokens + int(budget)
         if system:
             cfg["system_instruction"] = system
         if self.profile.temperature is not None:

@@ -11,7 +11,7 @@ import json
 from enum import Enum
 from typing import Any, Iterable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 Point = tuple[float, float]
 
@@ -194,6 +194,7 @@ class ImageInfo(BaseModel):
     crop: BBox | None = None  # page crop in original coordinates
     scale: float = 1.0  # working / original (after crop)
     stroke_width: float | None = None
+    content_rotation: int = 0  # synthetic ground truth: clockwise rotation of the page content in this image
 
 
 class TraceEvent(BaseModel):
@@ -205,6 +206,8 @@ class TraceEvent(BaseModel):
 
 
 class DiagramGraph(BaseModel):
+    model_config = {"extra": "ignore"}
+
     image: ImageInfo = Field(default_factory=ImageInfo)
     is_drawing: bool | None = None
     drawing_confidence: float | None = None
@@ -215,6 +218,7 @@ class DiagramGraph(BaseModel):
     summary: str | None = None
     notes: list[str] = Field(default_factory=list)
     trace: list[TraceEvent] = Field(default_factory=list)
+    _id_floor: dict[str, int] = PrivateAttr(default_factory=dict)
 
     # ------------------------------------------------------------------ lookup
     def shape(self, sid: str) -> Shape | None:
@@ -244,11 +248,11 @@ class DiagramGraph(BaseModel):
 
     # --------------------------------------------------------------- id utils
     def next_id(self, prefix: str) -> str:
-        existing = {s.id for s in self.shapes} | {c.id for c in self.connections} | {t.id for t in self.texts}
-        i = 1
-        while f"{prefix}{i}" in existing:
-            i += 1
-        return f"{prefix}{i}"
+        """Fresh id, never reusing a number (ids of removed elements may still be referenced).
+        ``renumber()`` compacts them at the end of an analysis."""
+        nums = [int(x.id[len(prefix):]) for x in (*self.shapes, *self.connections, *self.texts) if x.id.startswith(prefix) and x.id[len(prefix):].isdigit()]
+        self._id_floor[prefix] = max([self._id_floor.get(prefix, 0), *nums]) + 1
+        return f"{prefix}{self._id_floor[prefix]}"
 
     def renumber(self) -> None:
         """Give stable, compact ids (S1.., C1.., T1..) ordered top-to-bottom, left-to-right."""
@@ -290,6 +294,7 @@ class DiagramGraph(BaseModel):
             r.subject = m(r.subject)
             r.object = m(r.object)
             r.via = m(r.via)
+        self._id_floor = {}
         self.shapes.sort(key=lambda s: int(s.id[1:]))
         self.texts.sort(key=lambda t: int(t.id[1:]))
         self.connections.sort(key=lambda c: int(c.id[1:]))
