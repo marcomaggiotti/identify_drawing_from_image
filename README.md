@@ -166,7 +166,31 @@ Predictions are mapped back to the original pixel coordinates (undoing crop, sca
 * connection F1, on the pairs of elements each line joins
 * seconds per image
 
-<!-- results-table -->
+### Results so far
+
+Held-out synthetic pages: 50 validation pages of a 500-page set, with no VLM. The local detector is a YOLO11n-seg trained for 30 epochs on the 450 training pages, on CPU at 800 px (about 2.5 h on 4 cores):
+
+| system | shapes P/R/F1 | type acc | family acc | containment F1 | texts F1 | text CER | inside acc | connections F1 | s/img |
+|---|---|---|---|---|---|---|---|---|---|
+| classical CV | 0.89/0.85/0.87 | 0.91 | 0.95 | 1.00 | 0.66 | - | 0.96 | 0.17 | 0.60 |
+| CV + local YOLO | 0.90/1.00/0.95 | 0.91 | 0.95 | 0.98 | 0.67 | - | 0.93 | 0.21 | 1.00 |
+| local YOLO only | 0.99/0.99/0.99 | 0.91 | 0.96 | 0.90 | 0.66 | - | 0.77 | 0.23 | 0.82 |
+
+* The trained detector closes most of the classical detector's gaps on shapes: recall goes from 0.85 to 1.00 with `cv+yolo`.
+* Classical outlines give tighter polygons and therefore better nesting, which is why `cv+yolo` is recommended over `yolo` alone.
+* Reading the text (CER) and connections need a VLM. Without one, the text is located but not read.
+
+The detector also transfers to the real scans. On `rotated_nested_rectangles.jpg`, `cv+yolo` finds the large nested rounded rectangles and nested ovals that the classical pass alone misses. It also fires a few false "scribble" detections:
+
+![classical CV + trained detector](docs/images/example_cv_yolo_overlay.jpg)
+
+To reproduce:
+
+```bash
+drawid synth -n 500 --seed 7 --out data/synth500
+drawid train-detector --data data/synth500/data.yaml --epochs 30 --imgsz 800 --device cpu
+drawid benchmark --data data/synth500 --vlm none --limit 50 --detector cv+yolo --weights models/detector.pt
+```
 
 ## Output schema (abridged)
 
@@ -209,5 +233,5 @@ configs/example.yaml   examples/images   scripts/download_fonts.py   tests/
 ```
 
 ```bash
-pytest          # 27 tests, ~25 s; a scripted mock VLM exercises the whole agent loop
+pytest          # 38 tests, ~40 s; a scripted mock VLM exercises the whole agent loop
 ```
