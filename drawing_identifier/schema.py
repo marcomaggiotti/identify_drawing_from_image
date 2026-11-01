@@ -171,6 +171,7 @@ class TextItem(BaseModel):
     crossed_out: bool = False
     confidence: float = 1.0
     source: list[str] = Field(default_factory=list)
+    attributes: dict[str, Any] = Field(default_factory=dict)
 
 
 class Relation(BaseModel):

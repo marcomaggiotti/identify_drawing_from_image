@@ -1,0 +1,41 @@
+"""Reading text from image segments with many engines, comparing them, and reaching consensus."""
+
+from .engines import (
+    TIER_NAMES,
+    VARIANTS,
+    CallableTranscriber,
+    EasyOCRTranscriber,
+    Reading,
+    TesseractTranscriber,
+    Transcriber,
+    TrOCRTranscriber,
+    VLMTranscriber,
+    all_engines,
+    crop_segment,
+    make_variants,
+    select_engines,
+    vlm_traits,
+)
+from .metrics import cer, diff_html, normalize, similarity, wer
+
+__all__ = [
+    "TIER_NAMES",
+    "VARIANTS",
+    "CallableTranscriber",
+    "EasyOCRTranscriber",
+    "Reading",
+    "TesseractTranscriber",
+    "Transcriber",
+    "TrOCRTranscriber",
+    "VLMTranscriber",
+    "all_engines",
+    "crop_segment",
+    "make_variants",
+    "select_engines",
+    "vlm_traits",
+    "cer",
+    "diff_html",
+    "normalize",
+    "similarity",
+    "wer",
+]

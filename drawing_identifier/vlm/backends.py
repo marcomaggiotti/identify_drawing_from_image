@@ -278,7 +278,16 @@ class HuggingFaceBackend(VLMBackend):
             import transformers  # noqa: F401
         except ImportError:
             return False, "pip install 'drawing-identifier[hf]'"
-        return True, "ok (weights load on first use)"
+        adapter = self.profile.extra.get("adapter_path")
+        if adapter and not __import__("os").path.isdir(adapter):
+            return False, f"adapter not found: {adapter} (drawid finetune-vlm)"
+        if not hf_cached(self.profile.model):
+            return True, "downloads on first use"
+        return True, "ok"
+
+    @property
+    def needs_download(self) -> bool:
+        return not hf_cached(self.profile.model)
 
     def _load(self):
         if self._model is not None:
@@ -350,6 +359,21 @@ class MockBackend(VLMBackend):
         if not isinstance(ans, str):
             ans = json.dumps(ans)
         return VLMResponse(text=ans)
+
+
+def hf_cached(model: str) -> bool:
+    """True when ``model`` is a local folder or already in the Hugging Face cache."""
+    import os
+
+    if os.path.isdir(model):
+        return True
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        hit = try_to_load_from_cache(model, "config.json")
+        return isinstance(hit, str)
+    except Exception:
+        return False
 
 
 def blank_image(w: int = 8, h: int = 8) -> Image.Image:

@@ -1,4 +1,9 @@
-"""Small Gradio web UI: upload a drawing, pick the VLM (globally or per agent), inspect the result."""
+"""Gradio web UI.
+
+* **Analyse**: upload a drawing, pick the VLM (globally or per agent), inspect the result.
+* **Benchmark**: select a segment and compare every transcription engine on it, or run the
+  local-first consensus cascade (see :mod:`drawing_identifier.ui_bench`).
+"""
 
 from __future__ import annotations
 
@@ -47,31 +52,35 @@ def build_app(config_path: str | None = None):
         md += "\n\n**Agent trace**\n\n" + "\n".join(f"{e.step}. `{e.agent}` ({e.seconds:.1f}s): {e.message}" for e in res.graph.trace)
         return overlay, md, res.graph.to_json(include_trace=False), to_mermaid(res.graph)
 
+    from .ui_bench import build_benchmark_tab
+
     with gr.Blocks(title="Hand drawing identifier") as app:
         gr.Markdown("## Hand drawing identifier\nShapes, how they are nested and connected, and the text inside/near them.")
-        with gr.Row():
-            with gr.Column(scale=1):
-                image = gr.Image(type="numpy", label="Drawing")
-                vlm = gr.Dropdown(choices, value=base_cfg.default_vlm if base_cfg.default_vlm in choices else "auto", label="VLM for all agents")
-                custom = gr.Textbox(label="custom VLM spec", placeholder="ollama:qwen2.5vl:7b  |  openai_compatible:Qwen/Qwen2.5-VL-7B-Instruct@http://localhost:8000/v1")
-                with gr.Accordion("Per-agent VLM", open=False):
-                    agent_dd = [gr.Dropdown([DEFAULT, "none"] + profiles, value=DEFAULT, label=a) for a in AGENT_SLOTS]
-                mode = gr.Radio(["pipeline", "planner"], value=base_cfg.orchestrator.mode, label="Orchestration")
-                detector = gr.Radio(["cv", "cv+yolo", "yolo"], value=base_cfg.shapes.detector, label="Shape detector")
-                weights = gr.Textbox(value=base_cfg.shapes.weights or "", label="Local detector weights")
-                ocr = gr.Radio(["vlm", "trocr", "tesseract", "none"], value=base_cfg.text.ocr, label="Text reading")
-                verify = gr.Checkbox(value=base_cfg.verifier.enabled, label="VLM verification loop")
-                go = gr.Button("Analyse", variant="primary")
-                with gr.Accordion("VLM availability", open=False):
-                    gr.Dataframe(availability(), headers=["profile", "provider", "model", "available", "status"], interactive=False)
-            with gr.Column(scale=2):
-                overlay = gr.Image(label="Detections")
-                desc = gr.Markdown()
-                with gr.Tab("JSON"):
-                    js = gr.Code(language="json")
-                with gr.Tab("Mermaid"):
-                    mm = gr.Code()
-        go.click(run, [image, vlm, custom, mode, detector, weights, ocr, verify, *agent_dd], [overlay, desc, js, mm])
+        with gr.Tab("Analyse"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    image = gr.Image(type="numpy", label="Drawing")
+                    vlm = gr.Dropdown(choices, value=base_cfg.default_vlm if base_cfg.default_vlm in choices else "auto", label="VLM for all agents")
+                    custom = gr.Textbox(label="custom VLM spec", placeholder="ollama:qwen2.5vl:7b  |  openai_compatible:Qwen/Qwen2.5-VL-7B-Instruct@http://localhost:8000/v1")
+                    with gr.Accordion("Per-agent VLM", open=False):
+                        agent_dd = [gr.Dropdown([DEFAULT, "none"] + profiles, value=DEFAULT, label=a) for a in AGENT_SLOTS]
+                    mode = gr.Radio(["pipeline", "planner"], value=base_cfg.orchestrator.mode, label="Orchestration")
+                    detector = gr.Radio(["cv", "cv+yolo", "yolo"], value=base_cfg.shapes.detector, label="Shape detector")
+                    weights = gr.Textbox(value=base_cfg.shapes.weights or "", label="Local detector weights")
+                    ocr = gr.Radio(["vlm", "consensus", "tesseract", "easyocr", "trocr", "none"], value=base_cfg.text.ocr, label="Text reading (consensus = local-first cascade)")
+                    verify = gr.Checkbox(value=base_cfg.verifier.enabled, label="VLM verification loop")
+                    go = gr.Button("Analyse", variant="primary")
+                    with gr.Accordion("VLM availability", open=False):
+                        gr.Dataframe(availability(), headers=["profile", "provider", "model", "available", "status"], interactive=False)
+                with gr.Column(scale=2):
+                    overlay = gr.Image(label="Detections")
+                    desc = gr.Markdown()
+                    with gr.Tab("JSON"):
+                        js = gr.Code(language="json")
+                    with gr.Tab("Mermaid"):
+                        mm = gr.Code()
+            go.click(run, [image, vlm, custom, mode, detector, weights, ocr, verify, *agent_dd], [overlay, desc, js, mm])
+        build_benchmark_tab(gr, config_path)
     return app
 
 

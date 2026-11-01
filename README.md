@@ -48,7 +48,7 @@ Agents never call each other. They read and write a shared **blackboard** (the `
 | `text_layout` | groups the remaining ink into words and lines without crossing outlines | CV |
 | `topology` | computes direct containment and depth, overlaps and touching shapes, inside/near placement of text, line-end attachment (text, outline, interior or free), crossed outlines and line labels | geometry |
 | `vlm_analyst` | holistic VLM reading of the whole page, fused with the geometry: confirms or corrects types and adds missed shapes, texts and connections | VLM |
-| `text_reader` | transcribes every text region from crops (batched, or a labelled sheet for single-image VLMs), or with local TrOCR or Tesseract | VLM / OCR |
+| `text_reader` | transcribes every text region from crops (batched, or a labelled sheet for single-image VLMs) with the agent's VLM, a local OCR (Tesseract, EasyOCR, TrOCR), or the **consensus cascade**: local and small engines first, bigger and cloud models only for the regions they disagree on | VLM / OCR |
 | `verifier` | set-of-marks critique: remove, retype or add shapes, fix transcriptions, add or remove connections, request re-runs | VLM |
 
 Without any VLM the classical agents still produce a full structural graph: shapes, nesting, connections and text locations. Only the transcriptions are missing.
@@ -61,6 +61,7 @@ pip install -e '.[anthropic]'       # + Claude      (or [openai], [gemini])
 pip install -e '.[hf]'              # + local HuggingFace VLMs / LoRA fine-tuning
 pip install -e '.[yolo]'            # + the local detector (ultralytics)
 pip install -e '.[ui]'              # + web UI (gradio)
+pip install -e '.[ocr]'             # + local OCR engines (pytesseract + easyocr; also: apt install tesseract-ocr)
 pip install -e '.[all,dev]'
 drawid fonts                        # free handwriting fonts for the synthetic generator (Google Fonts, OFL)
 ```
@@ -102,12 +103,62 @@ drawid vlms        # profiles, providers, and which ones are usable right now (k
 drawid agents --vlm claude --agent-vlm text_reader=ollama-qwen   # who would use what
 ```
 
-* **Profiles.** `claude`, `claude-sonnet`, `claude-haiku`, `gpt`, `gemini`, `ollama-qwen`, `ollama-llama`, `vllm-qwen`, `hf-qwen`, `local-finetuned` and `mock`. Add your own in a YAML file (see [`configs/example.yaml`](configs/example.yaml)).
+* **Profiles.** `claude`, `claude-sonnet`, `claude-haiku`, `gpt`, `gemini`, `ollama-qwen-small`, `ollama-qwen`, `ollama-llama`, `vllm-qwen`, `hf-qwen`, `local-finetuned` and `mock`. Add your own in a YAML file (see [`configs/example.yaml`](configs/example.yaml)).
 * **Ad-hoc specs.** `provider:model[@base_url]`, for example `anthropic:claude-opus-5-5`, `openai:gpt-5`, `gemini:gemini-2.5-pro`, `ollama:qwen2.5vl:7b@http://gpu-box:11434`, `vllm:Qwen/Qwen2.5-VL-7B-Instruct`, `lmstudio:<model>`, `openrouter:<model>` or `hf:Qwen/Qwen2.5-VL-3B-Instruct`.
 * **`auto`** (the default) picks the first usable entry in `auto_preference`. **`none`** runs classical CV only.
 * **Per agent.** Use `--agent-vlm verifier=claude --agent-vlm text_reader=ollama-qwen`, or `agent_vlms:` in the config. For example, a cheap local model can read hundreds of crops while a strong model verifies and plans. `planner` is a valid agent name too.
 * **Web UI.** `drawid ui` has a global VLM drop-down (or a custom spec) and per-agent drop-downs.
 * Each profile also sets `max_image_side`, `max_images_per_call`, `bbox_format` (`xyxy_1000`, `yxyx_1000` or `xyxy_pixels`), `temperature`, `max_tokens` and `extra` (request parameters, `adapter_path` for LoRA weights, `device_map`, `dtype` …).
+* For the consensus cascade, profiles can also set `local`, `params_b` (model size), `cost_rank` (0 free … 5 most expensive) and `weight` (vote weight). These are inferred when not set: `hf`, `ollama` and `localhost` servers are local, the size comes from the model name (`qwen2.5vl:7b` → 7B), and the price from the model family (haiku / flash < sonnet / gpt-5 / pro < opus).
+
+## Transcription benchmark and consensus
+
+### Benchmark tab
+
+`drawid ui` → **Benchmark** tab: select a segment and compare every way of reading it, in one view.
+
+![benchmark tab](docs/images/benchmark_tab.jpg)
+
+1. **Pick a page.** Upload one, choose an example, or load a synthetic sample whose true text is known (it fills in the reference).
+2. **Select the segment.** Click two corners on the page, pick one of the text regions found by **Detect text regions** (rotated pages are turned upright), or type coordinates. You can also rotate the segment and set the padding.
+3. **Choose the engines.** Every configured VLM profile, extra VLM specs you type in, Tesseract in 4 page modes, EasyOCR and 4 TrOCR checkpoints. Each engine can run on 3 image variants: original, contrast-enhanced and binarised. Engines that can't run here are listed with how to enable them (API key, `ollama pull`, `pip install` …).
+4. **Optionally type the reference** (the ground truth).
+5. **Compare all selected engines** runs every engine × variant in parallel. One table shows each reading with a character diff against the reference, or against the consensus when there is no reference. It also shows CER, agreement with the other engines, confidence and time. Rows that support the consensus are green. Change the reference and press **Re-score**: nothing is re-run. Results download as JSON and CSV.
+6. **Consensus cascade** shows the escalation plan, which engines were called, what each one read, and which ones weren't needed.
+
+The same from the command line:
+
+```bash
+drawid engines                                         # every engine, in consensus order, with availability
+drawid transcribe page.jpg --box 105,478,528,543 --variants original,binarized --reference "Some A is r every B"
+drawid transcribe page.jpg --box 105,478,528,543 --consensus --engines auto          # local first, cloud only if needed
+drawid transcribe page.jpg --box ... --consensus --no-remote --json result.json      # never leave the machine
+```
+
+### Consensus between engines: local first, small to expensive
+
+Engines are ordered **local before remote**, then by size and price, and grouped in tiers:
+
+| tier | engines (default config) | default vote weight |
+|---|---|---|
+| 0 local OCR | Tesseract (4 page modes), EasyOCR, TrOCR (small / base / large) | 0.6 |
+| 1 local VLM ≤ 4B | `ollama-qwen-small` (qwen2.5vl:3b), `hf-qwen` (Qwen2.5-VL-3B), `local-finetuned` | 1.0 |
+| 2 local VLM > 4B | `ollama-qwen` (7B), `vllm-qwen` (7B on localhost), `ollama-llama` (11B) | 1.3 |
+| 3 cloud, cheap | `claude-haiku`, `gemini` (flash) | 1.5 |
+| 4 cloud, mid | `claude-sonnet`, `gpt` | 2.0 |
+| 5 cloud, top | `claude` (opus) | 2.5 |
+
+The cascade runs the cheapest tier, votes, and **escalates only if the answers so far don't agree**:
+
+* **Similar readings form one cluster.** Two readings belong together when their normalised edit-distance similarity is at least `similarity` (0.85 by default).
+* **A cluster wins when it has enough independent support.** It needs at least `min_agree` independent engine families (2 by default) and at least `agreement` of the weighted vote (60% by default). Weights grow with the tier and are scaled by each engine's confidence.
+* **An engine can't vote with itself.** Several modes of one engine (Tesseract's page modes, the TrOCR checkpoints) collapse into a single vote.
+* **The final text depends on how many engines agree.** With three or more, it is a word-level weighted vote (ROVER-style), so they correct each other's slips. Otherwise it is the reading of the strongest supporting engine.
+* **Only disputed segments go up.** On a page with many text regions, only the regions still in dispute are sent to the next tier, so the expensive models only see the hard cases.
+* **Cloud calls can be ruled out.** `allow_remote: false` never leaves the machine. `max_tier` caps the escalation, and `per_engine` escalates one engine at a time instead of a whole tier.
+* **No consensus is labelled honestly.** When nothing agrees, the answer is returned as `best_effort` with its agreement share, instead of being presented as certain.
+
+Use it in the pipeline with `--ocr consensus`, or set `text.ocr: consensus`. Each text item then records `attributes.consensus` (status, agreement, supporting engines, tiers run), and the trace says how many regions were settled locally and how many remote calls were made. The settings live in the `consensus:` section of the config.
 
 API keys are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, or the profile's `api_key_env`). Never put keys in config files.
 
@@ -213,7 +264,7 @@ drawid benchmark --data data/synth500 --vlm none --limit 50 --detector cv+yolo -
 
 * The classical shape detector is a high-precision **proposal generator**. Outlines with large pen gaps, heavily crossed nested rectangles, or ovals buried under text are often missed or come out as `region`. That is what the VLM agents and the trained detector are for.
 * Telling handwriting from connectors geometrically is hard when lines touch letters. Connection recall without a VLM is low.
-* Without a VLM, text is located but not read (`--ocr trocr` gives a local alternative).
+* Without a VLM, text is located but only read by local OCR (Tesseract, EasyOCR, TrOCR). These engines read printed or neat handwriting well, but they can't read 19th-century cursive. On the example scans the consensus cascade correctly reports `best_effort`: that is the signal to escalate to VLMs.
 * The VLM fine-tuning script is written for Qwen2.5-VL-style processors and needs a GPU. It was not run end to end in this repository's CI environment (no model download access).
 
 ## Project layout
@@ -224,14 +275,15 @@ drawing_identifier/
   vision/        preprocess, shapes, lines, text_layout, topology, geometry
   vlm/           backends (anthropic, openai/compatible, gemini, ollama, hf, mock) + registry
   synthetic/     hand-drawing primitives, handwriting, scene generator, dataset exporters
+  transcription/ engines (every VLM + Tesseract / EasyOCR / TrOCR), metrics, consensus cascade, segment benchmark
   training/      YOLO detector training/inference, VLM LoRA fine-tuning
   export/        overlay renderer, DOT / Mermaid / text description
   evaluation.py  metrics, coordinate mapping, VLM benchmark
   prompts.py     prompts + the JSON contract shared by agents and fine-tuning data
-  cli.py, ui.py
+  cli.py, ui.py, ui_bench.py (Benchmark tab)
 configs/example.yaml   examples/images   scripts/download_fonts.py   tests/
 ```
 
 ```bash
-pytest          # 38 tests, ~40 s; a scripted mock VLM exercises the whole agent loop
+pytest          # 56 tests, ~60 s; scripted mock VLMs exercise the agent loop and the consensus cascade
 ```

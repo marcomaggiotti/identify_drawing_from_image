@@ -12,7 +12,6 @@ import numpy as np
 from ..export.render import render_overlay
 from ..prompts import (
     SYSTEM_PROMPT,
-    TEXT_READ_PROMPT,
     VERIFY_PROMPT,
     analysis_prompt,
     bbox_polygon,
@@ -42,14 +41,15 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- text reader
 class TextReaderAgent(Agent):
     name = "text_reader"
-    description = "Read (transcribe) the handwriting in every text region: VLM on image crops, or a local OCR (TrOCR / Tesseract)."
+    description = (
+        "Read (transcribe) the handwriting in every text region: with the agent's VLM, a local OCR "
+        "(Tesseract / EasyOCR / TrOCR), or a consensus cascade that starts with local and small engines "
+        "and escalates to bigger / cloud models only for the regions they disagree on."
+    )
     requires = ("text_regions",)
     provides = ("text_read",)
     uses_vlm = True
-
-    def __init__(self, config, vlm=None):
-        super().__init__(config, vlm)
-        self._trocr = None
+    invalidates = ("verified",)
 
     def can_run(self) -> bool:
         mode = self.config.text.ocr
@@ -71,6 +71,22 @@ class TextReaderAgent(Agent):
             crop = cv2.resize(crop, (max(1, int(crop.shape[1] * s)), 56), interpolation=cv2.INTER_CUBIC)
         return crop
 
+    def _single_engine(self, mode: str):
+        from ..transcription import EasyOCRTranscriber, TesseractTranscriber, TrOCRTranscriber, VLMTranscriber, select_engines
+
+        if mode == "vlm":
+            return VLMTranscriber(self.vlm, self.vlm.name, self.config.text.batch_size)
+        if mode == "trocr":
+            return TrOCRTranscriber("base-handwritten")
+        if mode == "tesseract":
+            return TesseractTranscriber(7)
+        if mode == "easyocr":
+            return EasyOCRTranscriber("en")
+        sel = select_engines(self.config, [mode])  # any engine id, e.g. tesseract:psm6 or vlm:ollama-qwen
+        if not sel.engines:
+            raise ValueError(f"text.ocr engine {mode!r} is not usable: {sel.unavailable or sel.unknown}")
+        return sel.engines[0]
+
     def run(self, ctx: AnalysisContext, force: bool = False, ids: list[str] | None = None, **_: Any) -> AgentReport:
         g = ctx.graph
         # a forced re-read never overwrites transcriptions the verifier corrected
@@ -84,100 +100,65 @@ class TextReaderAgent(Agent):
             return AgentReport(self.name, "nothing to read")
         mode = self.config.text.ocr
         crops = {t.id: self._crop(ctx.image, t, ctx.th) for t in todo}
-        results: dict[str, dict] = {}
-        if mode == "vlm":
-            results = self._read_vlm(crops)
-        elif mode == "trocr":
-            results = self._read_trocr(crops)
-        elif mode == "tesseract":
-            results = self._read_tesseract(crops)
+        if mode == "consensus":
+            return self._run_consensus(todo, crops)
+        from ..transcription import make_variants
+
+        engine = self._single_engine(mode)
+        readings = engine.read_batch({k: make_variants(c)[engine.preferred_variant] for k, c in crops.items()})
         n = 0
+        tag = "vlm_ocr" if mode == "vlm" else engine.id
         for t in todo:
-            r = results.get(t.id)
-            if not isinstance(r, dict):
+            r = readings.get(t.id)
+            if r is None or not r.ok:
                 continue
-            raw_txt = r.get("text")
-            txt = "" if raw_txt is None else str(raw_txt).strip()
-            if txt:
-                t.text = txt
+            if r.text:
+                t.text = r.text
                 n += 1
-            t.crossed_out = bool(_as_bool(r.get("crossed_out"), t.crossed_out))
-            try:
-                conf = float(r.get("confidence") or 0.7)
-            except (TypeError, ValueError):
-                conf = 0.7
-            t.confidence = round(min(1.0, max(0.0, conf)), 3)
-            if mode not in t.source:
-                t.source.append(mode if mode != "vlm" else "vlm_ocr")
-        return AgentReport(self.name, f"transcribed {n}/{len(todo)} text region(s) with {mode}", {"read": n, "requested": len(todo)})
+            t.crossed_out = bool(r.crossed_out or t.crossed_out)
+            t.confidence = round(0.7 if r.confidence is None else r.confidence, 3)
+            if tag not in t.source:
+                t.source.append(tag)
+        errors = sum(1 for r in readings.values() if not r.ok)
+        return AgentReport(
+            self.name,
+            f"transcribed {n}/{len(todo)} text region(s) with {engine.id}" + (f" ({errors} failed)" if errors else ""),
+            {"read": n, "requested": len(todo), "engine": engine.id},
+        )
 
-    # ---- VLM
-    def _read_vlm(self, crops: dict[str, np.ndarray]) -> dict[str, dict]:
-        ids = list(crops)
-        per_call = max(1, min(self.config.text.batch_size, self.vlm.max_images_per_call))
-        sheet_mode = self.vlm.max_images_per_call == 1 and self.config.text.batch_size > 1
-        step = self.config.text.batch_size if sheet_mode else per_call
-        out: dict[str, dict] = {}
-        for i in range(0, len(ids), step):
-            batch = ids[i : i + step]
-            if sheet_mode:
-                images = [_sheet([crops[b] for b in batch], batch)]
-                prompt = TEXT_READ_PROMPT.format(n=len(batch), ids=", ".join(batch)).replace(
-                    f"Each of the {len(batch)} images is a crop",
-                    f"The image is a sheet of {len(batch)} crops, one per row, each labelled with its id on the left; each crop is",
-                )
-            else:
-                images = [crops[b] for b in batch]
-                prompt = TEXT_READ_PROMPT.format(n=len(batch), ids=", ".join(batch))
-            try:
-                ans = self.vlm.generate_json(prompt, images, system=SYSTEM_PROMPT, max_tokens=200 + 120 * len(batch))
-            except Exception as e:
-                log.warning("text_reader VLM batch failed: %s", e)
-                continue
-            items = ans.get("items", []) if isinstance(ans, dict) else ans
-            if isinstance(items, list):
-                for k, it in enumerate(items):
-                    if not isinstance(it, dict):
-                        continue
-                    tid = str(it.get("id") or (batch[k] if k < len(batch) else ""))
-                    if tid in batch:
-                        out[tid] = it
-        return out
+    def _run_consensus(self, todo: list[TextItem], crops: dict[str, np.ndarray]) -> AgentReport:
+        from ..transcription import select_engines
+        from ..transcription.consensus import ConsensusCascade
 
-    # ---- local OCR
-    def _read_trocr(self, crops):
-        if self._trocr is None:
-            from transformers import pipeline
-
-            self._trocr = pipeline("image-to-text", model="microsoft/trocr-base-handwritten")
-        from PIL import Image
-
-        out = {}
-        for tid, c in crops.items():
-            r = self._trocr(Image.fromarray(c[:, :, ::-1]))
-            out[tid] = {"text": r[0]["generated_text"] if r else "", "confidence": 0.6}
-        return out
-
-    def _read_tesseract(self, crops):
-        import pytesseract
-
-        out = {}
-        for tid, c in crops.items():
-            txt = pytesseract.image_to_string(c, config="--psm 7").strip()
-            out[tid] = {"text": txt, "confidence": 0.4}
-        return out
-
-
-def _sheet(crops: list[np.ndarray], ids: list[str]) -> np.ndarray:
-    rows = []
-    width = max(c.shape[1] for c in crops) + 110
-    for c, tid in zip(crops, ids):
-        row = np.full((c.shape[0] + 16, width, 3), 255, np.uint8)
-        row[8 : 8 + c.shape[0], 100 : 100 + c.shape[1]] = c
-        cv2.putText(row, tid, (6, row.shape[0] // 2 + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.line(row, (0, row.shape[0] - 1), (width, row.shape[0] - 1), (200, 200, 200), 1)
-        rows.append(row)
-    return cv2.vconcat(rows)
+        cc = self.config.consensus
+        sel = select_engines(self.config, cc.engines)
+        if not sel.engines:
+            return AgentReport(self.name, f"no transcription engine available ({sel.unavailable})", skipped=True)
+        cascade = ConsensusCascade(sel.engines, cc)
+        results = cascade.run_batch(crops)
+        n = 0
+        status: dict[str, int] = {}
+        for t in todo:
+            r = results[t.id]
+            status[r.status] = status.get(r.status, 0) + 1
+            if r.text:
+                t.text = r.text
+                t.crossed_out = r.crossed_out or t.crossed_out
+                t.confidence = round(r.agreement if r.status == "consensus" else 0.5 * r.agreement, 3)
+                n += 1
+                if "consensus" not in t.source:
+                    t.source.append("consensus")
+            t.attributes["consensus"] = {k: v for k, v in r.to_dict().items() if k != "votes"}
+        calls = sum(r.calls for r in results.values())
+        remote = sum(r.remote_calls for r in results.values())
+        local_only = sum(1 for r in results.values() if r.status == "consensus" and r.remote_calls == 0)
+        return AgentReport(
+            self.name,
+            f"consensus transcribed {n}/{len(todo)} region(s) with {len(sel.engines)} engine(s): "
+            + ", ".join(f"{v} {k}" for k, v in sorted(status.items()))
+            + f"; {local_only} settled locally, {calls} engine call(s) of which {remote} remote",
+            {"read": n, "requested": len(todo), "calls": calls, "remote_calls": remote, "settled_locally": local_only, **{f"n_{k}": v for k, v in status.items()}},
+        )
 
 
 # --------------------------------------------------------------------------- VLM analyst

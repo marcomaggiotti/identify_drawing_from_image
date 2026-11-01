@@ -26,7 +26,7 @@ openai = ["openai>=1.40"]
 gemini = ["google-genai>=1.0"]
 hf = ["torch>=2.2", "transformers>=4.49", "accelerate>=0.30", "peft>=0.12"]
 yolo = ["ultralytics>=8.3"]
-ocr = ["pytesseract>=0.3.10"]
+ocr = ["pytesseract>=0.3.10", "easyocr>=1.7"]
 ui = ["gradio>=4.0"]
 dev = ["pytest>=7.4"]
 all = [
@@ -39,6 +39,8 @@ all = [
     "peft>=0.12",
     "ultralytics>=8.3",
     "gradio>=4.0",
+    "pytesseract>=0.3.10",
+    "easyocr>=1.7",
 ]
 
 [project.scripts]

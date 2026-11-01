@@ -23,6 +23,11 @@ class VLMProfile(BaseModel):
     max_images_per_call: int = 8
     bbox_format: str = "xyxy_1000"  # xyxy_1000 | yxyx_1000 | xyxy_pixels
     timeout: float = 180.0
+    # consensus ordering: inferred from provider/model/base_url when left unset
+    local: bool | None = None  # runs on your own hardware (hf, ollama, localhost servers)
+    params_b: float | None = None  # model size in billions of parameters
+    cost_rank: float | None = None  # relative price: 0 free/local, 1 cheap ... 5 most expensive
+    weight: float | None = None  # vote weight in the consensus (default from the tier)
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -59,10 +64,24 @@ class ConnectionsConfig(BaseModel):
 
 class TextConfig(BaseModel):
     near_scale: float = 2.5
-    ocr: str = "vlm"
+    ocr: str = "vlm"  # vlm | consensus | tesseract | easyocr | trocr | <engine id> | none
     batch_size: int = 6
     crop_pad: int = 6
     max_items: int = 150
+
+
+class ConsensusConfig(BaseModel):
+    """Escalating consensus between transcription engines (cheap/local first, expensive last)."""
+
+    engines: list[str] | str = "auto"  # "auto" = every available engine, or a list of engine ids
+    min_agree: int = 2  # distinct engines that must agree
+    agreement: float = 0.6  # weighted share of the votes the winning answer needs
+    similarity: float = 0.85  # two readings agree when 1 - normalised edit distance >= this
+    case_sensitive: bool = True  # "A" and "a" are different labels in logic diagrams
+    allow_remote: bool = True  # False: never escalate to cloud models
+    max_tier: int = 5  # 0 local OCR, 1 local VLM <=4B, 2 local VLM >4B, 3 cheap cloud, 4 mid cloud, 5 top cloud
+    per_engine: bool = False  # escalate one engine at a time instead of a whole tier
+    include_mock: bool = False
 
 
 class ToggleConfig(BaseModel):
@@ -86,6 +105,7 @@ class AppConfig(BaseModel):
     text: TextConfig = Field(default_factory=TextConfig)
     vlm_analyst: ToggleConfig = Field(default_factory=ToggleConfig)
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
+    consensus: ConsensusConfig = Field(default_factory=ConsensusConfig)
 
     def vlm_for(self, agent: str) -> str:
         return self.agent_vlms.get(agent, self.default_vlm)

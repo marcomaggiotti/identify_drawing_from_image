@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from pathlib import Path
 
 import yaml
@@ -56,7 +55,7 @@ def _add_common(p: argparse.ArgumentParser, vlm_multi: bool = False) -> None:
     p.add_argument("--orientation", help="auto | none | 0 | 90 | 180 | 270")
     p.add_argument("--detector", choices=["cv", "yolo", "cv+yolo"], help="shape detector")
     p.add_argument("--weights", help="local detector weights (drawid train-detector)")
-    p.add_argument("--ocr", choices=["vlm", "trocr", "tesseract", "none"], help="how text is read")
+    p.add_argument("--ocr", help="how text is read: vlm | consensus | tesseract | easyocr | trocr | <engine id> | none")
     p.add_argument("--no-verify", action="store_true", help="skip the VLM verification loop")
     p.add_argument("--set", action="append", metavar="KEY=VALUE", help="override any config value, e.g. shapes.fit_threshold=0.84")
 
@@ -202,6 +201,92 @@ def cmd_benchmark(args) -> int:
     return 0
 
 
+def cmd_engines(args) -> int:
+    from .transcription.engines import TIER_NAMES
+    from .ui_bench import engine_catalogue
+
+    cfg = _config(args)
+    infos = engine_catalogue(cfg, ",".join(args.vlm_spec or []))
+    print("Transcription engines, in consensus order (local first, then by size and price):\n")
+    for i in infos:
+        mark = "ready" if i["ready"] else ("download" if i["available"] else "no")
+        size = f"{i['params_b']:g}B" if i["params_b"] < 99 else "cloud"
+        print(f"  {i['id']:<28} tier {i['tier']} {TIER_NAMES[i['tier']]:<18} {size:>6}  weight {i['weight']:<4} {mark:<8} {i['status']}")
+    print("\nready = usable now; download = weights fetched on first explicit use; select with --engines id1,id2 or auto/local")
+    return 0
+
+
+def _parse_box(text: str | None):
+    if not text:
+        return None
+    vals = [float(v) for v in text.replace(" ", "").split(",")]
+    if len(vals) != 4:
+        raise SystemExit("--box expects x0,y0,x1,y1")
+    return tuple(vals)
+
+
+def cmd_transcribe(args) -> int:
+    from .transcription import crop_segment, select_engines
+    from .transcription.bench import consensus_of_rows, rows_to_json, run_segment_benchmark, sort_rows
+    from .transcription.consensus import ConsensusCascade
+    from .vision.preprocess import load_image
+
+    cfg = _config(args)
+    cc = cfg.consensus.model_copy(
+        update={
+            k: v
+            for k, v in {
+                "min_agree": args.min_agree,
+                "agreement": args.agreement,
+                "similarity": args.similarity,
+                "allow_remote": False if args.no_remote else None,
+                "per_engine": True if args.per_engine else None,
+            }.items()
+            if v is not None
+        }
+    )
+    selection = args.engines if args.engines in ("auto", "local") else [e.strip() for e in args.engines.split(",") if e.strip()]
+    specs = args.vlm_spec or []
+    if not isinstance(selection, str):
+        selection = selection + [f"vlm:{s}" for s in specs]
+    sel = select_engines(cfg, selection, extra_specs=specs)
+    if sel.unavailable and isinstance(selection, str):
+        print(f"  {len(sel.unavailable)} engine(s) not available, see `drawid engines`")
+    else:
+        for k, why in sel.unavailable.items():
+            print(f"  skipped {k}: {why}")
+    for k in sel.unknown:
+        print(f"  unknown engine {k!r} (see `drawid engines`)")
+    if not sel.engines:
+        print("no engine available")
+        return 1
+    seg = crop_segment(load_image(args.image), _parse_box(args.box), args.pad, args.rotate)
+    if args.consensus:
+        casc = ConsensusCascade(sel.engines, cc)
+        print("\n".join(casc.describe()))
+        res = casc.run(seg)
+        for i, v in enumerate(res.votes, 1):
+            reading = f"error: {v.error}" if v.error else v.text
+            print(f"  {i:>2}. {v.engine_id:<26} {reading!r:<40} {'agrees' if v.agrees else ''}")
+        print(res.summary())
+        if args.json:
+            Path(args.json).write_text(rows_to_json([], None, res, args.reference, args.box), encoding="utf-8")
+        return 0
+    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    rows = run_segment_benchmark(seg, sel.engines, variants, args.reference, case_sensitive=cc.case_sensitive)
+    cons = consensus_of_rows(rows, cc)
+    w = max(len(r.engine_id) for r in rows)
+    for r in sort_rows(rows):
+        score = f"CER {r.cer:.3f}" if r.cer is not None else (f"agree {r.agreement:.2f}" if r.agreement is not None else "")
+        reading = f"error: {r.error}" if r.error else r.text
+        print(f"  {r.engine_id:<{w}} {r.variant:<9} {score:<11} {r.seconds:>5.2f}s  {reading!r}")
+    print(cons.summary())
+    if args.json:
+        Path(args.json).write_text(rows_to_json(rows, cons, None, args.reference, args.box), encoding="utf-8")
+        print(f"saved {args.json}")
+    return 0
+
+
 def cmd_ui(args) -> int:
     from .ui import launch
 
@@ -296,6 +381,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--report", default=None, help="write a markdown (+ .json) report")
     _add_common(p, vlm_multi=True)
     p.set_defaults(func=cmd_benchmark)
+
+    p = sub.add_parser("engines", help="list transcription engines (VLMs + local OCR) in consensus order")
+    p.add_argument("--vlm-spec", action="append", help="extra VLM spec to include, e.g. ollama:minicpm-v")
+    _add_common(p)
+    p.set_defaults(func=cmd_engines)
+
+    p = sub.add_parser("transcribe", help="read one segment with many engines and compare them, or run the consensus cascade")
+    p.add_argument("image")
+    p.add_argument("--box", help="segment x0,y0,x1,y1 in image pixels (default: whole image)")
+    p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270], help="rotate the segment clockwise")
+    p.add_argument("--pad", type=int, default=4)
+    p.add_argument("--engines", default="auto", help="auto | local | comma-separated ids (see `drawid engines`)")
+    p.add_argument("--vlm-spec", action="append", help="extra VLM to include, e.g. ollama:minicpm-v (repeatable)")
+    p.add_argument("--variants", default="original", help="original,enhanced,binarized")
+    p.add_argument("--reference", help="ground-truth text to score against")
+    p.add_argument("--consensus", action="store_true", help="run the local-first escalating cascade instead of every engine")
+    p.add_argument("--min-agree", type=int)
+    p.add_argument("--agreement", type=float)
+    p.add_argument("--similarity", type=float)
+    p.add_argument("--no-remote", action="store_true", help="never escalate to cloud models")
+    p.add_argument("--per-engine", action="store_true", help="escalate one engine at a time")
+    p.add_argument("--json", help="save all readings to this JSON file")
+    _add_common(p)
+    p.set_defaults(func=cmd_transcribe)
 
     p = sub.add_parser("ui", help="web UI with VLM selection (needs gradio)")
     p.add_argument("--config")

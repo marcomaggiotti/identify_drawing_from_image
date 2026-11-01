@@ -38,7 +38,14 @@ shapes:
   weights: models/detector.pt
 
 text:
-  ocr: vlm                # vlm | trocr | tesseract | none
+  ocr: consensus          # vlm | consensus | tesseract | easyocr | trocr | <engine id> | none
+
+# local OCR -> local VLMs -> cloud, escalating only when the cheaper engines disagree
+consensus:
+  engines: [tesseract:psm7, easyocr:en, vlm:ollama-qwen-small, vlm:ollama-qwen, vlm:claude-haiku, vlm:claude]
+  min_agree: 2
+  agreement: 0.6
+  allow_remote: true      # false keeps every page on this machine
 
 verifier:
   max_rounds: 2
