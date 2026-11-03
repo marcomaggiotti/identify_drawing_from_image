@@ -135,7 +135,7 @@ def _deep_merge(base: dict, override: dict, _key: str | None = None) -> dict:
 
 
 def default_config_dict() -> dict:
-    text = resources.files("drawing_identifier").joinpath("resources/default.yaml").read_text()
+    text = resources.files("drawing_identifier").joinpath("resources/default.yaml").read_text(encoding="utf-8")
     return yaml.safe_load(text)
 
 

@@ -352,6 +352,25 @@ class VLMTranscriber(Transcriber):
         return out
 
 
+def find_tesseract() -> str | None:
+    """The tesseract binary: $TESSERACT_CMD, PATH, or the Windows installer's default folders
+    (the UB-Mannheim installer does not add itself to PATH)."""
+    import os
+
+    env = os.environ.get("TESSERACT_CMD")
+    if env and os.path.isfile(env):
+        return env
+    found = shutil.which("tesseract")
+    if found:
+        return found
+    if os.name == "nt":
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+            cand = os.path.join(base, "Tesseract-OCR", "tesseract.exe")
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
 class TesseractTranscriber(Transcriber):
     preferred_variant = "binarized"
     PSM = {7: "single line", 6: "block", 8: "single word", 13: "raw line"}
@@ -369,8 +388,8 @@ class TesseractTranscriber(Transcriber):
             import pytesseract  # noqa: F401
         except ImportError:
             return False, "pip install pytesseract (and the tesseract binary)"
-        if not shutil.which("tesseract"):
-            return False, "tesseract binary not found (apt install tesseract-ocr / brew install tesseract)"
+        if not find_tesseract():
+            return False, "tesseract binary not found (Windows: winget install UB-Mannheim.TesseractOCR; apt install tesseract-ocr; brew install tesseract; or set TESSERACT_CMD)"
         return True, "ok"
 
     def _read(self, image: np.ndarray) -> Reading:
@@ -378,6 +397,7 @@ class TesseractTranscriber(Transcriber):
 
         import pytesseract
 
+        pytesseract.pytesseract.tesseract_cmd = find_tesseract() or "tesseract"
         # tesseract's OpenMP threads thrash when several instances run at once (10x slower)
         os.environ.setdefault("OMP_THREAD_LIMIT", "1")
         config = f"--psm {self.psm}" + (f' --tessdata-dir "{self.tessdata_dir}"' if self.tessdata_dir else "")

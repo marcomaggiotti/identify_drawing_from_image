@@ -409,7 +409,7 @@ def cmd_search(args) -> int:
 def cmd_ui(args) -> int:
     from .ui import launch
 
-    launch(args.config, args.host, args.port, args.share)
+    launch(args.config, args.host, args.port, args.share, getattr(args, "open", False))
     return 0
 
 
@@ -597,6 +597,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--share", action="store_true")
+    p.add_argument("--open", action="store_true", help="open the UI in the default browser")
     p.set_defaults(func=cmd_ui)
 
     p = sub.add_parser("config", help="print the default configuration")

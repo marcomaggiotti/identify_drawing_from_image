@@ -53,6 +53,31 @@ Agents never call each other. They read and write a shared **blackboard** (the `
 
 Without any VLM the classical agents still produce a full structural graph: shapes, nesting, connections and text locations. Only the transcriptions are missing.
 
+## Run it on your PC
+
+No setup knowledge needed: the launcher creates a private Python environment in `.venv`, installs everything, downloads the handwriting fonts and opens the web UI at http://127.0.0.1:7860.
+
+1. Install **Python 3.10 or newer** (Windows: `winget install Python.Python.3.12`, or python.org with "Add python.exe to PATH" ticked; macOS: `brew install python`).
+2. Download the code: `git clone https://github.com/marcomaggiotti/identify_drawing_from_image`, or GitHub's *Code → Download ZIP* and unzip it.
+3. Start it:
+   * **Windows:** double-click `start.bat`.
+   * **macOS / Linux:** run `./start.sh` in a terminal.
+
+   The first run installs about 1–2 GB of packages (mostly PyTorch for EasyOCR) and takes a few minutes. Later runs start in seconds.
+
+| Command | What it does |
+|---|---|
+| `start.bat` / `./start.sh` | UI, local OCR (Tesseract, EasyOCR, TrOCR) and the Claude / GPT / Gemini clients |
+| `start.bat full` | also local HuggingFace VLMs and the YOLO detector (large download; a GPU helps) |
+| `start.bat update` | reinstall after downloading newer code |
+
+Everything works offline with the classical pipeline. Optional extras:
+* **Tesseract** (the fastest local OCR tier): `winget install UB-Mannheim.TesseractOCR`, `brew install tesseract` or `sudo apt install tesseract-ocr`. The app finds it in its default Windows folder; set `TESSERACT_CMD` if it is installed somewhere else.
+* **A free local VLM**: install [Ollama](https://ollama.com/download), then run `ollama pull qwen2.5vl:3b` (or `qwen2.5vl:7b` with 16 GB RAM or more). The profiles `ollama-qwen-small` and `ollama-qwen` then appear as available, and the consensus uses them before any cloud model.
+* **Cloud models**: create a file named `.env` next to the launcher with lines such as `ANTHROPIC_API_KEY=sk-ant-...`, `OPENAI_API_KEY=...` or `GEMINI_API_KEY=...`. It is git-ignored, and the launcher loads it.
+
+The command line works from the same environment: `.venv\Scripts\drawid analyze page.jpg` on Windows, `.venv/bin/drawid analyze page.jpg` on macOS / Linux.
+
 ## Install
 
 ```bash

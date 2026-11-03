@@ -26,14 +26,31 @@ from PIL import Image
 
 def _run(cmd: list[str]) -> str:
     env = {**os.environ, "OMP_THREAD_LIMIT": "1"}
-    r = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, env=env)
+    cmd = [str(c) for c in cmd]
+    cmd[0] = _tool(cmd[0]) or cmd[0]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         raise RuntimeError(f"command failed: {' '.join(map(str, cmd))}\n{r.stdout[-1500:]}\n{r.stderr[-1500:]}")
     return r.stdout + r.stderr
 
 
+def _tool(name: str) -> str | None:
+    """PATH, else next to tesseract.exe (Windows installs the training tools there, off PATH)."""
+    from ..transcription.engines import find_tesseract
+
+    found = shutil.which(name)
+    if found or name == "tesseract":
+        return found or find_tesseract()
+    t = find_tesseract()
+    if t:
+        cand = Path(t).with_name(name + Path(t).suffix)
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
 def check_tools() -> list[str]:
-    return [t for t in ("tesseract", "lstmtraining", "combine_tessdata") if shutil.which(t) is None]
+    return [t for t in ("tesseract", "lstmtraining", "combine_tessdata") if _tool(t) is None]
 
 
 def make_lstmf(image_path: Path, text: str, workdir: Path, name: str) -> Path:
@@ -77,9 +94,9 @@ def finetune_tesseract(dataset_dir: str | Path, base_traineddata: str | Path, ou
         raise RuntimeError("no .lstmf examples were produced")
     n_val = max(1, int(len(lstmf) * val_fraction)) if len(lstmf) > 5 else 0
     train, val = lstmf[n_val:] or lstmf, lstmf[:n_val]
-    (out / "train_list.txt").write_text("\n".join(map(str, train)) + "\n")
+    (out / "train_list.txt").write_text("\n".join(map(str, train)) + "\n", encoding="utf-8")
     if val:
-        (out / "eval_list.txt").write_text("\n".join(map(str, val)) + "\n")
+        (out / "eval_list.txt").write_text("\n".join(map(str, val)) + "\n", encoding="utf-8")
     if progress:
         print(f"{len(train)} train / {len(val)} eval examples")
     base_lstm = out / "base.lstm"

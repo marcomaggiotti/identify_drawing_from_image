@@ -84,7 +84,7 @@ def build_app(config_path: str | None = None):
     return app
 
 
-def launch(config_path: str | None = None, host: str = "127.0.0.1", port: int = 7860, share: bool = False) -> None:
-    build_app(config_path).launch(server_name=host, server_port=port, share=share)
+def launch(config_path: str | None = None, host: str = "127.0.0.1", port: int = 7860, share: bool = False, open_browser: bool = False) -> None:
+    build_app(config_path).launch(server_name=host, server_port=port, share=share, inbrowser=open_browser)
 
 
