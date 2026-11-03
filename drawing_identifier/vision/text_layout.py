@@ -59,3 +59,40 @@ def group_text(text_mask: np.ndarray, barrier: np.ndarray | None, sw: float, tex
         sub_n = cv2.connectedComponents(region[y0:y1, x0:x1].astype(np.uint8), connectivity=8)[0] - 1
         blobs.append(TextBlob((x0 + bx, y0 + by, x1 + bx, y1 + by), cnt, sub_n))
     return blobs, th
+
+
+_CRAFT = None
+
+
+def craft_regions(bgr: np.ndarray, pad: int = 4) -> list[tuple[int, int, int, int]]:
+    """Word boxes from the CRAFT detector (via EasyOCR, detection only).
+
+    Morphology cannot split or join cursive reliably; CRAFT finds joined
+    handwritten words. Thresholds are looser than EasyOCR's defaults because
+    ink on aged paper is faint (from the author's find_text_regions_craft.py).
+    """
+    global _CRAFT
+    if _CRAFT is None:
+        import easyocr
+
+        try:
+            import torch
+
+            gpu = torch.cuda.is_available()
+        except Exception:
+            gpu = False
+        _CRAFT = easyocr.Reader(["en"], gpu=gpu, verbose=False)
+    h, w = bgr.shape[:2]
+    horizontal, free = _CRAFT.detect(bgr[:, :, ::-1], text_threshold=0.4, low_text=0.3, link_threshold=0.3, add_margin=0.15, width_ths=0.7)
+    boxes = [(b[0], b[2], b[1], b[3]) for b in (horizontal[0] if horizontal else [])]
+    for quad in free[0] if free else []:
+        xs = [q[0] for q in quad]
+        ys = [q[1] for q in quad]
+        boxes.append((min(xs), min(ys), max(xs), max(ys)))
+    out = []
+    for x0, y0, x1, y1 in boxes:
+        x0, y0 = max(0, int(x0) - pad), max(0, int(y0) - pad)
+        x1, y1 = min(w, int(x1) + pad), min(h, int(y1) + pad)
+        if x1 > x0 and y1 > y0:
+            out.append((x0, y0, x1, y1))
+    return out

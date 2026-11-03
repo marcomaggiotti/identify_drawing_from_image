@@ -43,10 +43,15 @@ class PreprocessConfig(BaseModel):
     orientation: str | int = "auto"
     orientation_use_vlm: bool = True
     remove_rules: bool = True
+    clean_prose: bool = False  # drop running prose, keep only diagram ink (see vision/clean.py)
+    clean_reach: float = 0.012  # cleanliness <-> completeness (x page diagonal)
 
 
 class ShapesConfig(BaseModel):
-    detector: str = "cv"
+    detector: str = "cv"  # any "+" combination of cv, yolo, spiral (e.g. cv+spiral, cv+yolo+spiral)
+    spiral_policy: str | None = None  # tuned AggPolicy json from `drawid tune-ovals`
+    spiral_min_agree: int = 3  # traces that must agree before the ensemble adds / retypes a shape
+    spiral_families: str = "both"  # both | raw | clean
     weights: str | None = None
     yolo_conf: float = 0.35
     min_shape_scale: float = 7.0
@@ -63,6 +68,7 @@ class ConnectionsConfig(BaseModel):
 
 
 class TextConfig(BaseModel):
+    regions: str = "morph"  # morph (ink grouping) | craft (CRAFT word detector, needs easyocr)
     near_scale: float = 2.5
     ocr: str = "vlm"  # vlm | consensus | tesseract | easyocr | trocr | <engine id> | none
     batch_size: int = 6
@@ -82,6 +88,7 @@ class ConsensusConfig(BaseModel):
     max_tier: int = 5  # 0 local OCR, 1 local VLM <=4B, 2 local VLM >4B, 3 cheap cloud, 4 mid cloud, 5 top cloud
     per_engine: bool = False  # escalate one engine at a time instead of a whole tier
     include_mock: bool = False
+    extra_engines: list[str] = Field(default_factory=list)  # e.g. ["trocr:models/trocr-eg", "smolvlm:models/smolvlm-eg", "tesseract:psm7:eg@models/tessdata"]
 
 
 class ToggleConfig(BaseModel):

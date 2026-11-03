@@ -74,6 +74,11 @@ class SynthConfig:
     max_skew_deg: float = 2.0
     p_stains: float = 0.5
     p_bleed_through: float = 0.25
+    # from the author's YOLO generator: Peirce's shaded-area convention (oddly enclosed areas
+    # filled grey), cuts running off the page edge, unlabelled solid blobs (ink stains, punch holes)
+    p_shaded: float = 0.12
+    p_edge_clip: float = 0.15
+    p_blobs: float = 0.35
     fonts_dir: str | None = "assets/fonts"  # scripts/download_fonts.py; falls back to OpenCV fonts
 
 
@@ -129,7 +134,8 @@ class SceneBuilder:
         self.shapes: list[_Shape] = []
         self.texts: list[_Text] = []
         self.conns: list[_Conn] = []
-        self.scribbles: list[tuple[str, np.ndarray]] = []  # (crossed-out shape id, scribble path)
+        self.scribbles: list[tuple[str, np.ndarray]] = []
+        self.shaded = False  # (crossed-out shape id, scribble path)
         self.fonts = list_fonts(cfg.fonts_dir)
         self._n = {"S": 0, "T": 0, "C": 0}
         self.margin = int(0.04 * min(self.W, self.H))
@@ -317,13 +323,24 @@ class SceneBuilder:
                 h = min(h, 0.6 * self.H)
                 x = rng.uniform(self.margin, self.W - self.margin - w)
                 y = rng.uniform(self.margin, self.H - self.margin - h)
+                if rng.random() < self.cfg.p_edge_clip:
+                    # the outer cut runs off the page: real scans clip figures at the margin
+                    side = int(rng.integers(0, 4))
+                    if side == 0:
+                        x = -rng.uniform(0.1, 0.3) * w
+                    elif side == 1:
+                        x = self.W - w * rng.uniform(0.7, 0.9)
+                    elif side == 2:
+                        y = -rng.uniform(0.1, 0.3) * h
+                    else:
+                        y = self.H - h * rng.uniform(0.7, 0.9)
                 b = (x, y, x + w, y + h)
                 if not self._gutter_ok(b) or any(_overlap(b, o, 0.04 * self.W) for o in boxes):
                     continue
                 boxes.append(b)
                 break
         for d, b in enumerate(boxes):
-            self.diag_occ[int(b[1]) : int(b[3]), int(b[0]) : int(b[2])] = True
+            self.diag_occ[max(0, int(b[1])) : max(0, int(b[3])), max(0, int(b[0])) : max(0, int(b[2]))] = True
             if rng.random() < self.cfg.p_venn:
                 self.build_venn(b, d)
             else:
@@ -448,6 +465,17 @@ class SceneBuilder:
             for _ in range(25):
                 x = rng.uniform(self.margin, self.W - self.margin - w)
                 y = rng.uniform(self.margin, self.H - self.margin - h)
+                if rng.random() < self.cfg.p_edge_clip:
+                    # the outer cut runs off the page: real scans clip figures at the margin
+                    side = int(rng.integers(0, 4))
+                    if side == 0:
+                        x = -rng.uniform(0.1, 0.3) * w
+                    elif side == 1:
+                        x = self.W - w * rng.uniform(0.7, 0.9)
+                    elif side == 2:
+                        y = -rng.uniform(0.1, 0.3) * h
+                    else:
+                        y = self.H - h * rng.uniform(0.7, 0.9)
                 b = (x, y, x + w, y + h)
                 if not self._gutter_ok(b) or self.diag_occ[int(y) : int(y + h), int(x) : int(x + w)].any() or not self._free(b):
                     continue
@@ -551,7 +579,23 @@ def render_scene(sc: SceneBuilder) -> np.ndarray:
     if rng.random() < cfg.p_stains:
         _stains(img, rng)
 
+    if rng.random() < cfg.p_shaded and sc.shapes:
+        # shaded-area convention: an area enclosed by an odd number of cuts is filled grey
+        count = np.zeros((H, W), np.uint8)
+        for s in sc.shapes:
+            m = np.zeros((H, W), np.uint8)
+            cv2.fillPoly(m, [np.round(s.polygon).astype(np.int32)], 1)
+            count += m
+        odd = (count % 2 == 1).astype(np.float32)
+        odd = cv2.GaussianBlur(odd, (0, 0), 0.8)
+        img -= (odd * rng.uniform(45, 95))[:, :, None]
+        sc.shaded = True
     ink = np.zeros((H, W), np.uint8)
+    if rng.random() < cfg.p_blobs:
+        for _ in range(int(rng.integers(1, 4))):  # unlabelled: a filled blob is not a cut
+            c = (int(rng.uniform(0, W)), int(rng.uniform(0, H)))
+            r = rng.uniform(0.6, 2.0) * sc.th
+            cv2.ellipse(ink, c, (int(r), int(r * rng.uniform(0.6, 1.0))), rng.uniform(0, 180), 0, 360, 255, -1, cv2.LINE_AA)
     for s in sc.shapes:
         draw_stroke(ink, s.path, sc.sw * rng.uniform(0.9, 1.1), 255, rng)
     for c in sc.conns:
@@ -726,6 +770,9 @@ def build_ground_truth(sc: SceneBuilder, M: np.ndarray, size: tuple[int, int], i
     build_relations(g, overlaps, touches)
     g.notes.append(f"synthetic: text_height={th:.1f}px stroke={sc.sw * scale:.2f}px two_page={sc.two_page} {info}")
     g.image.content_rotation = int(info.get("rotated", 0))
+    if sc.shaded:
+        for s in g.shapes:
+            s.attributes["shaded_area"] = s.depth % 2 == 0  # the area just inside an even-depth cut is oddly enclosed
     g.summary = _summary(g)
     return g
 

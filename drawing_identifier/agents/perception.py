@@ -49,6 +49,13 @@ class PreprocessAgent(Agent):
                 how = "vlm"
             elif choice == 0:
                 how = "classical+vlm"
+        if cfg.clean_prose:
+            from ..vision.clean import CleanParams, keep_mask
+
+            keep, _ = keep_mask(prep.ink, prep.image, prep.stroke_width, CleanParams(reach_frac=cfg.clean_reach))
+            removed = 1.0 - keep.sum() / max(1, prep.ink.sum())
+            prep.ink = prep.ink & keep
+            prep.notes.append(f"prose cleaning removed {removed:.0%} of the ink")
         ctx.prep = prep
         h, w = prep.ink.shape
         ow, oh = prep.original_size
@@ -173,6 +180,50 @@ class ShapeDetectionAgent(Agent):
             self._local = LocalDetector(cfg.weights, conf=cfg.yolo_conf)
         return self._local
 
+    def _fuse_spiral(self, prep, shapes: list[Shape]) -> int:
+        """Second, independent witness: the ensemble oval detector (many diverse traces + consensus).
+
+        A strongly agreed ellipse confirms (retypes) an irregular region it matches, or is added
+        when the main detector missed that outline entirely (open / gappy cuts)."""
+        from ..vision.oval_ensemble import AggPolicy, detect_ovals
+
+        cfg = self.config.shapes
+        pol = AggPolicy.load(cfg.spiral_policy) if cfg.spiral_policy else AggPolicy()
+        res = detect_ovals(prep.image, pol, cfg.spiral_families)
+        n = 0
+        for d in res.detections:
+            strong = d.agreement >= cfg.spiral_min_agree and (len(d.families) > 1 or cfg.spiral_families != "both")
+            best, best_iou = None, 0.0
+            for s in shapes:
+                iou = _ellipse_shape_iou(d, s, prep.ink.shape)
+                if iou > best_iou:
+                    best, best_iou = s, iou
+            if best is not None and best_iou >= 0.6:
+                if "spiral" not in best.source:
+                    best.source.append("spiral")
+                best.attributes["spiral_agreement"] = d.agreement
+                if best.type == ShapeType.REGION and strong:
+                    best.attributes["cv_type"] = best.type.value
+                    best.type = ShapeType.ELLIPSE if min(d.axes) / max(d.axes) < 0.85 else ShapeType.CIRCLE
+                    n += 1
+                best.confidence = round(min(1.0, best.confidence + 0.1), 3)
+            elif strong and best_iou < 0.3:
+                poly = d.polygon(72)
+                st = ShapeType.ELLIPSE if min(d.axes) / max(d.axes) < 0.85 else ShapeType.CIRCLE
+                shapes.append(
+                    Shape(
+                        id="",
+                        type=st,
+                        bbox=BBox.from_points(poly).round(),
+                        polygon=poly,
+                        confidence=round(float(d.confidence), 3),
+                        source=["spiral"],
+                        attributes={"spiral_agreement": d.agreement, "families": d.families, "boundary_support": d.bsupport},
+                    )
+                )
+                n += 1
+        return n
+
     def run(self, ctx: AnalysisContext, mode: str = "replace", relax: bool = False, **overrides: Any) -> AgentReport:
         cfg = self.config.shapes
         prep = ctx.prep
@@ -192,7 +243,8 @@ class ShapeDetectionAgent(Agent):
             params.bridge_gap_scale *= 1.5
             params.fit_threshold -= 0.04
         shapes: list[Shape] = []
-        if cfg.detector in ("cv", "cv+yolo") or self._local_detector() is None:
+        tokens = set(cfg.detector.split("+"))
+        if "cv" in tokens or (self._local_detector() is None and "spiral" not in tokens):
             for c in detect_shapes(prep.ink, params):
                 x0, y0, x1, y1 = c.bbox_xyxy
                 attrs = {"fit_scores": c.fit.scores, **{k: v for k, v in c.fit.attributes.items()}}
@@ -232,6 +284,9 @@ class ShapeDetectionAgent(Agent):
                     shapes.append(
                         Shape(id="", type=ShapeType(d["class"]), bbox=b.round(), polygon=[tuple(p) for p in poly], confidence=round(d["conf"], 3), source=["yolo"])
                     )
+        n_spiral = 0
+        if "spiral" in tokens:
+            n_spiral = self._fuse_spiral(prep, shapes)
         g = ctx.graph
         stale = None
         if mode == "merge":
@@ -254,10 +309,28 @@ class ShapeDetectionAgent(Agent):
             )
         if n_local:
             summary += f" (local detector: {n_local} detections)"
+        if "spiral" in tokens:
+            summary += f" (oval ensemble: {n_spiral} added/confirmed)"
         data: dict[str, Any] = {"n_shapes": len(g.shapes)}
         if stale is not None:
             data["invalidates"] = stale
         return AgentReport(self.name, summary, data)
+
+
+def _ellipse_shape_iou(det, s: Shape, shape_hw) -> float:
+    """Mask IoU between an ensemble ellipse and a shape polygon (on a small raster)."""
+    from ..vision.geometry import mask_iou, rasterize_polygon
+
+    x0, y0, x1, y1 = s.bbox.xyxy
+    dx0 = det.center[0] - max(det.axes) / 2
+    dy0 = det.center[1] - max(det.axes) / 2
+    ox, oy = min(x0, dx0) - 2, min(y0, dy0) - 2
+    span = max(x1, det.center[0] + max(det.axes) / 2) - ox + 4, max(y1, det.center[1] + max(det.axes) / 2) - oy + 4
+    sc = 128.0 / max(span)
+    shp = (int(span[1] * sc) + 2, int(span[0] * sc) + 2)
+    a = rasterize_polygon(det.polygon(48), shp, (ox, oy), sc)
+    b = rasterize_polygon(s.polygon, shp, (ox, oy), sc)
+    return mask_iou(a, b)
 
 
 def _num(v: Any, default: float, lo: float, hi: float) -> float:
@@ -343,6 +416,17 @@ class TextLayoutAgent(Agent):
             text_mask = ctx.prep.ink
         blobs, th = group_text(text_mask, ctx.artifacts.get("ring"), ctx.prep.stroke_width)
         ctx.text_height = th
+        method = "ink grouping"
+        if self.config.text.regions == "craft":
+            from ..vision.text_layout import TextBlob, craft_regions
+
+            try:
+                boxes = craft_regions(ctx.prep.image)
+                blobs = [TextBlob(b, int(text_mask[b[1] : b[3], b[0] : b[2]].sum()), 1) for b in boxes]
+                blobs = [b for b in blobs if b.ink_pixels > 0]  # boxes over erased outlines / connectors only
+                method = "CRAFT"
+            except Exception as e:  # missing easyocr / weights: keep the morphological regions
+                ctx.graph.notes.append(f"CRAFT text regions unavailable ({e.__class__.__name__}); used ink grouping")
         g = ctx.graph
         previous = [t for t in g.texts if "cv" in t.source]
         g.texts = [t for t in g.texts if "cv" not in t.source]
@@ -358,7 +442,7 @@ class TextLayoutAgent(Agent):
             if old is not None and old.text and old.bbox.iou(box) > 0.6:
                 item.text, item.confidence, item.crossed_out, item.source = old.text, old.confidence, old.crossed_out, list(old.source)
             g.texts.append(item)
-        return AgentReport(self.name, f"{len(blobs)} text region(s), text height ~{th:.0f}px", {"n_texts": len(blobs), "text_height": th})
+        return AgentReport(self.name, f"{len(blobs)} text region(s) by {method}, text height ~{th:.0f}px", {"n_texts": len(blobs), "text_height": th})
 
 
 # --------------------------------------------------------------------------- topology

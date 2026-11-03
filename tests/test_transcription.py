@@ -60,7 +60,7 @@ def test_crop_and_variants():
     seg = crop_segment(img, (150, 80, 50, 20), pad=0, rotation=90)  # corners in any order, rotated
     assert seg.shape[:2] == (100, 60)
     v = make_variants(np.full((20, 50, 3), 255, np.uint8))
-    assert set(v) == {"original", "enhanced", "binarized"} and v["original"].shape[0] >= 64
+    assert set(v) == {"original", "enhanced", "binarized", "upscaled", "thickened"} and v["original"].shape[0] >= 64
 
 
 # ------------------------------------------------------------------ ordering
@@ -277,7 +277,7 @@ def test_benchmark_tab_callbacks(tmp_path, monkeypatch):
     assert box == (50, 40, 350, 250)
     assert ui_bench.render_page(rgb, box, {"T1": {"box": (1, 1, 20, 20)}}, None).shape == rgb.shape
     assert ui_bench.segment(rgb, box, 90, 0).shape[:2] == (300, 210)
-    assert len(ui_bench.variant_gallery(ui_bench.segment(rgb, box))) == 3
+    assert len(ui_bench.variant_gallery(ui_bench.segment(rgb, box))) == 5
 
     fake = __import__("drawing_identifier.transcription.engines", fromlist=["EngineSelection"]).EngineSelection(
         engines=[engine("ocr", "Some", kind="ocr"), engine("vlm:a", "Some", size=3), engine("vlm:b", "Some", local=False, size=100, cost=5)]

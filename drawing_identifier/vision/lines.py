@@ -40,7 +40,21 @@ class LineParams:
     min_line_scale: float = 10.0
     max_ratio: float = 1.7  # skeleton length / extent above which a component is text
     min_length_px: float = 0.0  # e.g. 2.5 x text height, set by the agent
-    max_endpoints: int = 5  # a branching line of identity has 3-4 ends; handwriting has many
+    max_endpoints: int = 5
+    max_runs: float = 1.45  # runs per scanline above which a component reads as handwriting  # a branching line of identity has 3-4 ends; handwriting has many
+
+
+def runs_per_scanline(comp: np.ndarray) -> float:
+    """Mean ink runs per occupied scanline across the short axis: ~1.0 for one drawn
+    line, 1.4+ for cursive (loops and ascenders cross a scanline several times)."""
+    h, w = comp.shape
+    axis = 0 if w >= h else 1
+    c = comp.astype(np.int8)
+    transitions = np.abs(np.diff(c, axis=axis)).sum(axis=axis)
+    edge = c.take(0, axis=axis) + c.take(-1, axis=axis)
+    runs = (transitions + edge) / 2.0
+    occupied = comp.any(axis=axis)
+    return float(runs[occupied].mean()) if occupied.any() else 99.0
 
 
 def shape_ring_mask(shape_hw: tuple[int, int], contours: list[np.ndarray], sw: float) -> np.ndarray:
@@ -206,6 +220,8 @@ def extract_lines(ink: np.ndarray, ring: np.ndarray, params: LineParams) -> tupl
             mean_w = float(area) / sk_len
             if ratio > params.max_ratio:
                 continue  # wiggly: handwriting
+            if ratio > 1.15 and runs_per_scanline(comp) > params.max_runs:
+                continue  # crosses its own scanlines like cursive does
             if not heavy_pass and mean_w > 2.5 * sw:
                 continue  # blob / scribble
             if heavy_pass and mean_w < 1.3 * sw:

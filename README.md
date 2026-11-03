@@ -260,6 +260,42 @@ drawid benchmark --data data/synth500 --vlm none --limit 50 --detector cv+yolo -
 }
 ```
 
+## Reused from the earlier scripts
+
+These parts come from the earlier version of the project. Each was cleaned up, fixed where needed and made optional. The defaults behave as before.
+
+| Piece | Where | How to use |
+|---|---|---|
+| **Oval ensemble** (spiral v6): 12 traces in two families (raw scan and cleaned ink), clustered and scored by agreement, with random-search tuning of the aggregation policy | `vision/oval_ensemble.py` | `--detector cv+spiral` (UI radio too). Train a policy with `drawid tune-ovals --data data/synth --trials 200 --out oval_policy.json`, then set `shapes.spiral_policy`. |
+| **Prose cleaner** (`clean_eg`): keeps ink near ovals and lines and drops paragraphs | `vision/clean.py` | `drawid clean page.jpg --debug`, or `preprocess.clean_prose: true` before analysis |
+| **Line vs. cursive test**: runs per scanline | `vision/lines.py` | always on (`LineParams.max_runs`) |
+| **CRAFT text regions** (via EasyOCR) | `vision/text_layout.py` | `text.regions: craft` (slow on CPU, about 1.5 min per page) |
+| **More local engines**: SmolVLM 256M/500M/2.2B, TrOCR with token confidence, Tesseract with a custom language or model folder, upscaled and thickened variants | `transcription/engines.py` | ids such as `smolvlm:500m`, `trocr:<folder>` or `tesseract:psm7:eg@models/tessdata`, in the Benchmark tab or in `consensus.extra_engines` |
+| **Corrections loop**: "Save as correction" in the Benchmark tab writes `<dir>/images/*.png` and `manifest.jsonl` | `transcription/corrections.py` | `drawid ocr-dataset --synthetic data/synth --corrections data/corrections --out data/ocr` (corrections are repeated 3×) |
+| **OCR fine-tuning** | `training/finetune_tesseract.py`, `training/finetune_ocr.py` | `drawid finetune-tesseract --data data/ocr --base tessdata_best/eng.traineddata`; `drawid finetune-ocr --data data/ocr --engine trocr\|smolvlm` (SmolVLM uses LoRA merged into the weights; GPU recommended) |
+| **Search index**: one document per shape (text, nesting, connections), hash-3gram vectors; human corrections survive re-indexing | `index.py` | `drawid index pages/ --store data/index`; `drawid search loves --min-depth 1`. Local folder by default; `--store qdrant:<dir>` or `--qdrant-url` for Qdrant |
+| **Generator realism**: shaded (odd-parity) areas, shapes cut by the page edge, ink blobs | `synthetic/generator.py` | `SynthConfig.p_shaded / p_edge_clip / p_blobs` |
+
+Fixed while porting:
+* v6 traces passed a `family` argument that `Trace` no longer had.
+* The SmolVLM collator measured the prompt length without the image tokens, so it trained on part of the prompt. It now reuses `VLMCollator`.
+* The ensemble's ink-support check rejected every bridged contour on small pages. It now also tests the cluster's median ellipse, which lies on the stroke.
+
+What the measurements say (in this container):
+* **Oval ensemble:**
+  * on synthetic pages, it is weaker than the CV detector on its own, and the fusion is roughly neutral;
+  * on the real scans it recovers ovals the CV detector misses or labels `region`. That is why it is an opt-in detector token and not the default.
+* **Tesseract fine-tuning on synthetic crops** made it *worse* on held-out crops:
+
+  | Model | Mean CER |
+  |---|---|
+  | base `eng` fast | 0.92 |
+  | base `eng` best | 0.82 |
+  | fine-tuned, 300 iterations | 1.42 |
+  | fine-tuned, 3000 iterations | 2.57 |
+
+  The rendered fonts are too far from the real hand. Fine-tune on *corrections* from real scans, mixed with only a little synthetic data, and check against the base model with the Benchmark tab before using the result.
+
 ## Limitations
 
 * The classical shape detector is a high-precision **proposal generator**. Outlines with large pen gaps, heavily crossed nested rectangles, or ovals buried under text are often missed or come out as `region`. That is what the VLM agents and the trained detector are for.
@@ -272,12 +308,13 @@ drawid benchmark --data data/synth500 --vlm none --limit 50 --detector cv+yolo -
 ```
 drawing_identifier/
   agents/        base (Agent, blackboard), perception agents, VLM agents, orchestrator (pipeline + planner)
-  vision/        preprocess, shapes, lines, text_layout, topology, geometry
+  vision/        preprocess, shapes, lines, text_layout, topology, geometry, oval_ensemble, clean
   vlm/           backends (anthropic, openai/compatible, gemini, ollama, hf, mock) + registry
   synthetic/     hand-drawing primitives, handwriting, scene generator, dataset exporters
-  transcription/ engines (every VLM + Tesseract / EasyOCR / TrOCR), metrics, consensus cascade, segment benchmark
-  training/      YOLO detector training/inference, VLM LoRA fine-tuning
+  transcription/ engines (every VLM + Tesseract / EasyOCR / TrOCR), metrics, consensus cascade, segment benchmark, corrections
+  training/      YOLO detector training/inference, VLM LoRA fine-tuning, Tesseract / TrOCR / SmolVLM OCR fine-tuning
   export/        overlay renderer, DOT / Mermaid / text description
+  index.py       per-shape search index (local store or Qdrant)
   evaluation.py  metrics, coordinate mapping, VLM benchmark
   prompts.py     prompts + the JSON contract shared by agents and fine-tuning data
   cli.py, ui.py, ui_bench.py (Benchmark tab)
@@ -285,5 +322,5 @@ configs/example.yaml   examples/images   scripts/download_fonts.py   tests/
 ```
 
 ```bash
-pytest          # 56 tests, ~60 s; scripted mock VLMs exercise the agent loop and the consensus cascade
+pytest          # 67 tests (1 skipped without Tesseract training tools); scripted mock VLMs exercise the agent loop and the consensus cascade
 ```

@@ -37,7 +37,7 @@ TIER_NAMES = {
     5: "cloud (top)",
 }
 TIER_WEIGHT = {0: 0.6, 1: 1.0, 2: 1.3, 3: 1.5, 4: 2.0, 5: 2.5}
-VARIANTS = ("original", "enhanced", "binarized")
+VARIANTS = ("original", "enhanced", "binarized", "upscaled", "thickened")
 
 
 @dataclass
@@ -85,7 +85,17 @@ def make_variants(crop: np.ndarray, min_height: int = 64) -> dict[str, np.ndarra
     ink = binarize(flat)
     bw = np.where(ink, 0, 255).astype(np.uint8)
     bw = cv2.copyMakeBorder(bw, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=255)
-    return {"original": img, "enhanced": enhanced, "binarized": cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)}
+    # 2x upscale (Tesseract likes a ~30 px x-height) and a thickened copy that repairs thin,
+    # broken pen strokes (renders from the author's TextAgent retry strategies)
+    up = cv2.resize(bw, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    thick = cv2.erode(up, np.ones((2, 2), np.uint8))
+    return {
+        "original": img,
+        "enhanced": enhanced,
+        "binarized": cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR),
+        "upscaled": cv2.cvtColor(up, cv2.COLOR_GRAY2BGR),
+        "thickened": cv2.cvtColor(thick, cv2.COLOR_GRAY2BGR),
+    }
 
 
 def sheet(crops: list[np.ndarray], ids: list[str]) -> np.ndarray:
@@ -346,10 +356,13 @@ class TesseractTranscriber(Transcriber):
     preferred_variant = "binarized"
     PSM = {7: "single line", 6: "block", 8: "single word", 13: "raw line"}
 
-    def __init__(self, psm: int = 7, lang: str = "eng"):
-        super().__init__(f"tesseract:psm{psm}", f"Tesseract ({self.PSM.get(psm, f'psm {psm}')})", True, 0.02, 0.0)
+    def __init__(self, psm: int = 7, lang: str = "eng", tessdata_dir: str | None = None):
+        """``lang``/``tessdata_dir`` select e.g. a model fine-tuned with ``drawid finetune-tesseract``."""
+        suffix = "" if lang == "eng" and not tessdata_dir else f":{lang}" + (f"@{tessdata_dir}" if tessdata_dir else "")
+        super().__init__(f"tesseract:psm{psm}{suffix}", f"Tesseract ({self.PSM.get(psm, f'psm {psm}')}, {lang})", True, 0.02, 0.0)
         self.psm = psm
         self.lang = lang
+        self.tessdata_dir = tessdata_dir
 
     def available(self) -> tuple[bool, str]:
         try:
@@ -367,7 +380,8 @@ class TesseractTranscriber(Transcriber):
 
         # tesseract's OpenMP threads thrash when several instances run at once (10x slower)
         os.environ.setdefault("OMP_THREAD_LIMIT", "1")
-        d = pytesseract.image_to_data(image[:, :, ::-1], lang=self.lang, config=f"--psm {self.psm}", output_type=pytesseract.Output.DICT)
+        config = f"--psm {self.psm}" + (f' --tessdata-dir "{self.tessdata_dir}"' if self.tessdata_dir else "")
+        d = pytesseract.image_to_data(image[:, :, ::-1], lang=self.lang, config=config, output_type=pytesseract.Output.DICT)
         words, confs = [], []
         for txt, c in zip(d["text"], d["conf"]):
             c = float(c)
@@ -416,22 +430,22 @@ class EasyOCRTranscriber(Transcriber):
         return Reading(text=" ".join(r[1] for r in res), confidence=float(np.mean([r[2] for r in res])))
 
 
-class TrOCRTranscriber(Transcriber):
-    MODELS = {
-        "small-handwritten": ("microsoft/trocr-small-handwritten", 0.06),
-        "base-handwritten": ("microsoft/trocr-base-handwritten", 0.33),
-        "large-handwritten": ("microsoft/trocr-large-handwritten", 0.56),
-        "base-printed": ("microsoft/trocr-base-printed", 0.33),
-    }
-    _pipes: dict[str, Any] = {}
+def _token_confidence(torch, scores, n: int) -> float | None:
+    """Mean max-softmax probability of the generated tokens: a cheap self-assessed confidence."""
+    if not scores:
+        return None
+    probs = [torch.softmax(sc[0], -1).max().item() for sc in scores[:n]]
+    return float(np.mean(probs)) if probs else None
 
-    def __init__(self, variant: str = "base-handwritten"):
-        model, size = self.MODELS.get(variant, (variant, 0.33))
-        super().__init__(f"trocr:{variant}", f"TrOCR {variant}", True, size, 0.0)
-        self.model = model
+
+class _HFLocal(Transcriber):
+    """Shared plumbing for local transformers OCR models (weights cached per model)."""
+
+    _models: dict[str, Any] = {}
 
     def available(self) -> tuple[bool, str]:
         try:
+            import torch  # noqa: F401
             import transformers  # noqa: F401
         except ImportError:
             return False, "pip install 'drawing-identifier[hf]'"
@@ -445,15 +459,77 @@ class TrOCRTranscriber(Transcriber):
 
         return not hf_cached(self.model)
 
+
+class TrOCRTranscriber(_HFLocal):
+    """Microsoft TrOCR (handwriting line recogniser); ``variant`` may also be a fine-tuned folder."""
+
+    MODELS = {
+        "small-handwritten": ("microsoft/trocr-small-handwritten", 0.06),
+        "base-handwritten": ("microsoft/trocr-base-handwritten", 0.33),
+        "large-handwritten": ("microsoft/trocr-large-handwritten", 0.56),
+        "base-printed": ("microsoft/trocr-base-printed", 0.33),
+    }
+
+    def __init__(self, variant: str = "base-handwritten"):
+        model, size = self.MODELS.get(variant, (variant, 0.33))
+        super().__init__(f"trocr:{variant}", f"TrOCR {variant}", True, size, 0.0)
+        self.model = model
+
     def _read(self, image: np.ndarray) -> Reading:
+        import torch
+
+        if self.model not in self._models:
+            from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            self._models[self.model] = (TrOCRProcessor.from_pretrained(self.model), VisionEncoderDecoderModel.from_pretrained(self.model).to(dev).eval(), dev)
+        proc, model, dev = self._models[self.model]
+        with torch.no_grad():
+            pix = proc(images=image[:, :, ::-1], return_tensors="pt").pixel_values.to(dev)
+            out = model.generate(pix, max_new_tokens=48, output_scores=True, return_dict_in_generate=True)
+        text = proc.batch_decode(out.sequences, skip_special_tokens=True)[0]
+        return Reading(text=text, confidence=_token_confidence(torch, out.scores, len(out.scores)))
+
+
+class SmolVLMTranscriber(_HFLocal):
+    """SmolVLM (HuggingFaceTB): a tiny open VLM that runs locally on CPU; the bottom VLM tier of
+    the consensus. ``model`` may be a hub id or a folder fine-tuned with ``drawid finetune-ocr``.
+    Ported from the author's SmolVlmOcr (prompt + token-probability confidence)."""
+
+    kind = "vlm"
+    PROMPT = "Transcribe the handwritten words in this image. Return ONLY the words, nothing else. If there are no words, return an empty string."
+    MODELS = {"256m": "HuggingFaceTB/SmolVLM-256M-Instruct", "500m": "HuggingFaceTB/SmolVLM-500M-Instruct", "2.2b": "HuggingFaceTB/SmolVLM-Instruct"}
+
+    def __init__(self, variant: str = "500m"):
+        model = self.MODELS.get(variant.lower(), variant)
+
+        size = {"256m": 0.256, "500m": 0.5, "2.2b": 2.2}.get(variant.lower()) or model_size_b(model) or 0.5
+        super().__init__(f"smolvlm:{variant}", f"SmolVLM {variant}", True, size, 0.0)
+        self.model = model
+
+    def _read(self, image: np.ndarray) -> Reading:
+        import re as _re
+
+        import torch
         from PIL import Image
 
-        if self.model not in self._pipes:
-            from transformers import pipeline
+        if self.model not in self._models:
+            import transformers
+            from transformers import AutoProcessor
 
-            self._pipes[self.model] = pipeline("image-to-text", model=self.model)
-        r = self._pipes[self.model](Image.fromarray(image[:, :, ::-1]))
-        return Reading(text=r[0]["generated_text"] if r else "", confidence=None)
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            cls = getattr(transformers, "AutoModelForImageTextToText", None) or getattr(transformers, "AutoModelForVision2Seq")
+            dtype = torch.bfloat16 if dev == "cuda" else torch.float32
+            self._models[self.model] = (AutoProcessor.from_pretrained(self.model), cls.from_pretrained(self.model, dtype=dtype).to(dev).eval(), dev)
+        proc, model, dev = self._models[self.model]
+        msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": self.PROMPT}]}]
+        prompt = proc.apply_chat_template(msgs, add_generation_prompt=True)
+        inputs = proc(text=prompt, images=[Image.fromarray(image[:, :, ::-1])], return_tensors="pt").to(dev)
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=64, do_sample=False, output_scores=True, return_dict_in_generate=True)
+        seq = out.sequences[0][inputs["input_ids"].shape[1] :]
+        text = _re.sub(r"^\s*assistant[:\s]*", "", proc.decode(seq, skip_special_tokens=True).strip(), flags=_re.I)
+        return Reading(text=text, confidence=_token_confidence(torch, out.scores, len(seq)))
 
 
 class CallableTranscriber(Transcriber):
@@ -483,7 +559,37 @@ def local_ocr_engines() -> list[Transcriber]:
         TesseractTranscriber(13),
         EasyOCRTranscriber("en"),
         *[TrOCRTranscriber(v) for v in TrOCRTranscriber.MODELS],
+        SmolVLMTranscriber("256m"),
+        SmolVLMTranscriber("500m"),
     ]
+
+
+def engine_from_id(eid: str, config: AppConfig | None = None, registry=None) -> Transcriber | None:
+    """Build an engine from its id, including custom ones:
+    ``tesseract:psm7[:lang][@tessdata_dir]``, ``easyocr:<lang>``, ``trocr:<variant|folder>``,
+    ``smolvlm:<256m|500m|2.2b|folder>``, ``vlm:<profile or provider:model spec>``."""
+    kind, _, rest = eid.partition(":")
+    if not rest:
+        return None
+    if kind == "tesseract":
+        tessdata = None
+        if "@" in rest:
+            rest, tessdata = rest.split("@", 1)
+        parts = rest.split(":")
+        psm = int(parts[0].replace("psm", "") or 7)
+        return TesseractTranscriber(psm, parts[1] if len(parts) > 1 else "eng", tessdata)
+    if kind == "easyocr":
+        return EasyOCRTranscriber(rest)
+    if kind == "trocr":
+        return TrOCRTranscriber(rest)
+    if kind == "smolvlm":
+        return SmolVLMTranscriber(rest)
+    if kind == "vlm" and config is not None:
+        from ..vlm.registry import VLMRegistry
+
+        reg = registry or VLMRegistry(config)
+        return VLMTranscriber(reg.get(rest), rest, config.text.batch_size)
+    return None
 
 
 def all_engines(config: AppConfig, registry=None, extra_specs: Iterable[str] = (), include_mock: bool | None = None) -> list[Transcriber]:
@@ -493,6 +599,10 @@ def all_engines(config: AppConfig, registry=None, extra_specs: Iterable[str] = (
     registry = registry or VLMRegistry(config)
     include_mock = config.consensus.include_mock if include_mock is None else include_mock
     engines: list[Transcriber] = local_ocr_engines()
+    for eid in config.consensus.extra_engines:  # e.g. fine-tuned trocr/smolvlm/tesseract models
+        e = engine_from_id(eid, config, registry)
+        if e is not None:
+            engines.append(e)
     for name, prof in config.vlms.items():
         if prof.provider == "mock" and not include_mock:
             continue
@@ -525,12 +635,8 @@ def select_engines(config: AppConfig, selection: str | Iterable[str] = "auto", r
     for wid in wanted:
         e = by_id.get(wid) or by_id.get(f"vlm:{wid}")
         if e is None and explicit and ":" in wid:
-            from ..vlm.registry import VLMRegistry
-
             try:
-                reg = registry or VLMRegistry(config)
-                spec = wid[4:] if wid.startswith("vlm:") else wid
-                e = VLMTranscriber(reg.get(spec), spec, config.text.batch_size)
+                e = engine_from_id(wid if wid.split(":", 1)[0] in ("tesseract", "easyocr", "trocr", "smolvlm", "vlm") else f"vlm:{wid}", config, registry)
             except Exception:
                 e = None
         if e is None:

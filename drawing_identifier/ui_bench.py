@@ -29,6 +29,7 @@ from .transcription.bench import (
     sort_rows,
 )
 from .transcription.consensus import ConsensusCascade, ConsensusResult, rank_engines
+from .transcription.corrections import load_manifest, save_correction
 from .transcription.metrics import cer, diff_html
 
 Box = tuple[float, float, float, float]
@@ -404,6 +405,10 @@ def build_benchmark_tab(gr, config_path: str | None = None) -> None:
                 with gr.Row():
                     sort_dd = gr.Dropdown(["auto", "cer", "agreement", "engine"], value="auto", label="sort by", scale=1)
                     rescore_btn = gr.Button("Re-score with reference", scale=1)
+                with gr.Row():
+                    corr_dir = gr.Textbox(value="data/corrections", label="corrections folder", scale=2)
+                    save_btn = gr.Button("Save as correction", scale=1)
+                corr_msg = gr.Markdown("The reference becomes ground truth for fine-tuning local readers (`drawid ocr-dataset`, `finetune-tesseract`, `finetune-ocr`).")
             with gr.Column(scale=2):
                 page = gr.Image(label="Page — click two corners to select the segment", interactive=False, height=460)
                 with gr.Row():
@@ -557,6 +562,17 @@ def build_benchmark_tab(gr, config_path: str | None = None) -> None:
             [orig, *coords, rot, pad, engines_cb, custom, reference, *settings, sort_dd],
             [casc_md, result_table, summary, diff_view, rows_state, files],
         )
+        def on_save(img, bx, by, ex, ey, r, p, ref, folder, rows_d):
+            if img is None or not (ref or "").strip():
+                return "Select a segment and type the correct text in the reference box first."
+            box = clean_box(img, (bx, by, ex, ey)) or full_box(img)
+            seg = segment(img, box, r, p)
+            readings = {d["engine_id"]: d["text"] for d in (rows_d or []) if not d.get("error")}
+            rec = save_correction(folder or "data/corrections", np.ascontiguousarray(seg[:, :, ::-1]), ref, {"box": [round(v, 1) for v in box], "rotation": int(r or 0), "engine_readings": readings})
+            n = len(load_manifest(folder or "data/corrections"))
+            return f"Saved `{rec['file']}` = **{html.escape(rec['text'])}** — {n} correction(s) in `{folder}`."
+
+        save_btn.click(on_save, [orig, *coords, rot, pad, reference, corr_dir, rows_state], [corr_msg])
         rescore_btn.click(on_rescore, [rows_state, reference, *settings, sort_dd, last], [result_table, summary, diff_view, rows_state, files])
         sort_dd.input(on_rescore, [rows_state, reference, *settings, sort_dd, last], [result_table, summary, diff_view, rows_state, files])
 

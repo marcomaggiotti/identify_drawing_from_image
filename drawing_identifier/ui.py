@@ -65,7 +65,7 @@ def build_app(config_path: str | None = None):
                     with gr.Accordion("Per-agent VLM", open=False):
                         agent_dd = [gr.Dropdown([DEFAULT, "none"] + profiles, value=DEFAULT, label=a) for a in AGENT_SLOTS]
                     mode = gr.Radio(["pipeline", "planner"], value=base_cfg.orchestrator.mode, label="Orchestration")
-                    detector = gr.Radio(["cv", "cv+yolo", "yolo"], value=base_cfg.shapes.detector, label="Shape detector")
+                    detector = gr.Radio(["cv", "cv+spiral", "cv+yolo", "cv+yolo+spiral", "yolo"], value=base_cfg.shapes.detector, label="Shape detector")
                     weights = gr.Textbox(value=base_cfg.shapes.weights or "", label="Local detector weights")
                     ocr = gr.Radio(["vlm", "consensus", "tesseract", "easyocr", "trocr", "none"], value=base_cfg.text.ocr, label="Text reading (consensus = local-first cascade)")
                     verify = gr.Checkbox(value=base_cfg.verifier.enabled, label="VLM verification loop")

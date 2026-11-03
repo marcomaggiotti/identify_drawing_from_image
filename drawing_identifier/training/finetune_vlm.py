@@ -101,14 +101,19 @@ def finetune_vlm(
     limit: int | None = None,
     bf16: bool = True,
     gradient_checkpointing: bool = True,
+    train_file: str = "vlm_train.jsonl",
+    val_file: str = "vlm_val.jsonl",
+    merge: bool = False,
 ) -> Path:
+    """``merge=True`` bakes the LoRA into the base weights, so the output folder loads with a
+    plain ``from_pretrained`` (used for SmolVLM OCR models)."""
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForImageTextToText, AutoProcessor, Trainer, TrainingArguments
 
     data_dir = Path(data_dir)
-    train = load_jsonl(data_dir / "vlm_train.jsonl", limit)
-    val_path = data_dir / "vlm_val.jsonl"
+    train = load_jsonl(data_dir / train_file, limit)
+    val_path = data_dir / val_file
     val = load_jsonl(val_path, max(8, (limit or 10**9) // 10)) if val_path.exists() else None
     log.info("training on %d samples (%s validation)", len(train), len(val) if val else 0)
 
@@ -158,6 +163,8 @@ def finetune_vlm(
     )
     trainer.train()
     out = Path(out_dir)
+    if merge:
+        model = model.merge_and_unload()
     model.save_pretrained(out)
     processor.save_pretrained(out)
     (out / "drawid_adapter.json").write_text(json.dumps({"base_model": base_model, "max_image_side": max_image_side}, indent=2))

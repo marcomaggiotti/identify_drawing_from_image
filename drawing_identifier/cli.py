@@ -53,7 +53,7 @@ def _add_common(p: argparse.ArgumentParser, vlm_multi: bool = False) -> None:
     p.add_argument("--agent-vlm", action="append", metavar="AGENT=VLM", help="per-agent VLM, e.g. text_reader=ollama-qwen (repeatable)")
     p.add_argument("--mode", choices=["pipeline", "planner"], help="fixed pipeline or VLM planner")
     p.add_argument("--orientation", help="auto | none | 0 | 90 | 180 | 270")
-    p.add_argument("--detector", choices=["cv", "yolo", "cv+yolo"], help="shape detector")
+    p.add_argument("--detector", choices=["cv", "yolo", "cv+yolo", "cv+spiral", "cv+yolo+spiral"], help="shape detector (spiral = the oval ensemble)")
     p.add_argument("--weights", help="local detector weights (drawid train-detector)")
     p.add_argument("--ocr", help="how text is read: vlm | consensus | tesseract | easyocr | trocr | <engine id> | none")
     p.add_argument("--no-verify", action="store_true", help="skip the VLM verification loop")
@@ -287,6 +287,125 @@ def cmd_transcribe(args) -> int:
     return 0
 
 
+def _images_in(paths: list[str]) -> list[Path]:
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp"}
+    out: list[Path] = []
+    for p in paths:
+        pp = Path(p)
+        out += sorted(x for x in pp.iterdir() if x.suffix.lower() in exts) if pp.is_dir() else [pp]
+    return out
+
+
+def cmd_clean(args) -> int:
+    import cv2
+
+    from .vision.clean import CleanParams, clean_page, debug_overlay
+    from .vision.preprocess import load_image, preprocess
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    for img in _images_in(args.images):
+        p = preprocess(load_image(str(img)), rotation=None if args.orientation in (None, "auto") else int(args.orientation))
+        cleaned, keep, dbg = clean_page(p.image, p.ink, p.stroke_width, CleanParams(reach_frac=args.reach))
+        cv2.imwrite(str(out / f"{img.stem}_clean.png"), cleaned)
+        if args.debug:
+            cv2.imwrite(str(out / f"{img.stem}_clean_debug.png"), debug_overlay(p.image, dbg))
+        print(f"{img.name}: kept {keep.sum() / max(1, p.ink.sum()):.0%} of the ink -> {out / (img.stem + '_clean.png')}")
+    return 0
+
+
+def cmd_tune_ovals(args) -> int:
+    import glob
+
+    import cv2
+
+    from .schema import DiagramGraph
+    from .vision.oval_ensemble import ellipse_gt_from_graph, tune_policy
+
+    pages = []
+    for a in sorted(glob.glob(str(Path(args.data) / "annotations" / args.split / "*.json")))[: args.limit]:
+        img = cv2.imread(a.replace("annotations", "images", 1).replace(".json", ".jpg"))
+        if img is not None:
+            pages.append((img, ellipse_gt_from_graph(DiagramGraph.from_json(Path(a).read_text(encoding="utf-8")))))
+    if not pages:
+        raise SystemExit(f"no annotated pages under {args.data}/annotations/{args.split} (make some with `drawid synth`)")
+    print(f"tuning the oval-ensemble policy on {len(pages)} page(s), {args.trials} trials")
+    pol, r, st = tune_policy(pages, args.trials, args.seed, args.families)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    pol.save(args.out)
+    print(f"best reward {r:.2f} {st} -> {args.out}\nuse it with: --detector cv+spiral --set shapes.spiral_policy={args.out}")
+    return 0
+
+
+def cmd_ocr_dataset(args) -> int:
+    from .transcription.corrections import build_ocr_dataset
+
+    info = build_ocr_dataset(args.out, args.synthetic or [], args.corrections or [], args.split, args.limit, args.val_fraction)
+    print(json.dumps(info, indent=2))
+    return 0
+
+
+def cmd_finetune_tesseract(args) -> int:
+    from .training.finetune_tesseract import finetune_tesseract
+
+    path = finetune_tesseract(args.data, args.base, args.out, args.lang, args.iterations, limit=args.limit)
+    print(f"model: {path}\nuse it as engine  tesseract:psm7:{args.lang}@{Path(args.out).resolve()}  (consensus.extra_engines)")
+    return 0
+
+
+def cmd_finetune_ocr(args) -> int:
+    from .training.finetune_ocr import finetune_smolvlm, finetune_trocr
+
+    if args.engine == "trocr":
+        path = finetune_trocr(args.data, args.base or "microsoft/trocr-base-handwritten", args.out, int(args.epochs), args.lr or 3e-5, args.batch_size, args.max_steps)
+    else:
+        path = finetune_smolvlm(args.data, args.base or "HuggingFaceTB/SmolVLM-500M-Instruct", args.out, args.epochs, args.lr or 1e-4, args.batch_size, max_steps=args.max_steps)
+    print(f"model: {path}\nuse it as engine  {args.engine}:{Path(path).resolve()}  (consensus.extra_engines)")
+    return 0
+
+
+def cmd_index(args) -> int:
+    from .index import index_graph, open_store
+    from .schema import DiagramGraph
+
+    store, emb = open_store(args.store, args.qdrant_url)
+    orc = None
+    total = 0
+    for p in args.inputs:
+        pp = Path(p)
+        files = sorted(pp.glob("*.json")) if pp.is_dir() and any(pp.glob("*.json")) else ([pp] if pp.suffix == ".json" else _images_in([p]))
+        for f in files:
+            if f.suffix == ".json":
+                g = DiagramGraph.from_json(f.read_text(encoding="utf-8"))
+                overlay = f.with_name(f.stem + "_overlay.png")
+            else:
+                if orc is None:
+                    from .agents import Orchestrator
+
+                    orc = Orchestrator(_config(args))
+                res = orc.analyze(str(f))
+                saved = res.save(args.out)
+                g, overlay = res.graph, Path(saved["overlay"])
+            n = index_graph(store, emb, g, f.stem, str(overlay) if overlay.exists() else None)
+            total += n
+            print(f"{f.name}: {n} shape(s) indexed")
+    print(f"{total} document(s) in {args.qdrant_url or args.store}")
+    return 0
+
+
+def cmd_search(args) -> int:
+    from .index import open_store, search
+
+    store, emb = open_store(args.store, args.qdrant_url)
+    hits = search(store, emb, args.text, args.limit, shape_type=args.type, min_depth=args.min_depth, min_children=args.min_children, page=args.page, corrected=True if args.corrected else None)
+    for pid, score, p in hits:
+        mark = " (corrected)" if p.get("human_corrected") else ""
+        print(f"{score:5.2f}  {p['page']}/{p['shape_id']}  {p['type']:<17} depth {p['depth']} children {p['n_children']}  {p.get('text', '')!r}{mark}  [{pid}]")
+    if not hits:
+        print("no match")
+    return 0
+
+
 def cmd_ui(args) -> int:
     from .ui import launch
 
@@ -405,6 +524,73 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", help="save all readings to this JSON file")
     _add_common(p)
     p.set_defaults(func=cmd_transcribe)
+
+    p = sub.add_parser("clean", help="remove running prose, keep only the diagrams (writes *_clean.png)")
+    p.add_argument("images", nargs="+")
+    p.add_argument("--out", default="outputs/clean")
+    p.add_argument("--reach", type=float, default=0.012, help="larger keeps more words attached to a figure (x page diagonal)")
+    p.add_argument("--orientation", default="auto")
+    p.add_argument("--debug", action="store_true", help="also write the cut / heavy-line / region overlay")
+    p.set_defaults(func=cmd_clean)
+
+    p = sub.add_parser("tune-ovals", help="random-search the oval-ensemble aggregation policy on annotated (synthetic) pages")
+    p.add_argument("--data", required=True, help="folder written by `drawid synth`")
+    p.add_argument("--split", default="train")
+    p.add_argument("--limit", type=int, default=40)
+    p.add_argument("--trials", type=int, default=200)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--families", default="both", choices=["both", "raw", "clean"])
+    p.add_argument("--out", default="models/oval_policy.json")
+    p.set_defaults(func=cmd_tune_ovals)
+
+    p = sub.add_parser("ocr-dataset", help="merge synthetic OCR crops and saved corrections into one fine-tuning set")
+    p.add_argument("--synthetic", action="append", help="`drawid synth` folder (repeatable)")
+    p.add_argument("--corrections", action="append", help="corrections folder saved from the Benchmark tab (repeatable)")
+    p.add_argument("--out", default="data/ocr")
+    p.add_argument("--split", default="train")
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--val-fraction", type=float, default=0.1)
+    p.set_defaults(func=cmd_ocr_dataset)
+
+    p = sub.add_parser("finetune-tesseract", help="continue Tesseract's LSTM on an OCR dataset")
+    p.add_argument("--data", required=True, help="folder from `drawid ocr-dataset`")
+    p.add_argument("--base", required=True, help="a FLOAT base model, e.g. tessdata_best/eng.traineddata")
+    p.add_argument("--out", default="models/tessdata")
+    p.add_argument("--lang", default="eg")
+    p.add_argument("--iterations", type=int, default=3000)
+    p.add_argument("--limit", type=int, default=None)
+    p.set_defaults(func=cmd_finetune_tesseract)
+
+    p = sub.add_parser("finetune-ocr", help="fine-tune TrOCR or SmolVLM (LoRA, merged) on an OCR dataset")
+    p.add_argument("--data", required=True)
+    p.add_argument("--engine", choices=["trocr", "smolvlm"], default="smolvlm")
+    p.add_argument("--base", default=None)
+    p.add_argument("--out", default="models/ocr")
+    p.add_argument("--epochs", type=float, default=8)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--max-steps", type=int, default=-1)
+    p.set_defaults(func=cmd_finetune_ocr)
+
+    p = sub.add_parser("index", help="add analysed pages (result JSONs or images) to the searchable store")
+    p.add_argument("inputs", nargs="+", help="*.json from `drawid analyze`, folders of them, or images (analysed first)")
+    p.add_argument("--store", default="data/index", help="folder, or qdrant:<folder> for embedded Qdrant")
+    p.add_argument("--qdrant-url", default=None, help="Qdrant server, e.g. http://localhost:6333")
+    p.add_argument("--out", default="outputs", help="where analysis results of images go")
+    _add_common(p)
+    p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser("search", help="find shapes by the text inside them and by structure")
+    p.add_argument("text", nargs="?", default=None)
+    p.add_argument("--store", default="data/index")
+    p.add_argument("--qdrant-url", default=None)
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--type", default=None, help="shape type, e.g. ellipse")
+    p.add_argument("--min-depth", type=int, default=None)
+    p.add_argument("--min-children", type=int, default=None, help="e.g. 2 = cuts holding at least two nested cuts")
+    p.add_argument("--page", default=None)
+    p.add_argument("--corrected", action="store_true", help="only human-corrected transcriptions")
+    p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("ui", help="web UI with VLM selection (needs gradio)")
     p.add_argument("--config")

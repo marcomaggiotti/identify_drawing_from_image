@@ -83,9 +83,14 @@ preprocess:
   orientation: auto       # auto | none | 0 | 90 | 180 | 270 (clockwise)
   orientation_use_vlm: true
   remove_rules: true
+  clean_prose: false      # true: drop running prose, keep only the diagrams' ink (`drawid clean`)
+  clean_reach: 0.012      # larger keeps more words attached to a figure, but may grab prose
 
 shapes:
-  detector: cv            # cv | yolo | cv+yolo
+  detector: cv            # "+" combination of cv, yolo, spiral (oval ensemble), e.g. cv+spiral
+  spiral_policy: null     # tuned ensemble policy from `drawid tune-ovals`
+  spiral_min_agree: 3
+  spiral_families: both   # both | raw | clean
   weights: null           # path to YOLO weights trained with `drawid train-detector`
   yolo_conf: 0.35
   min_shape_scale: 7.0    # min shape size in stroke widths
@@ -100,6 +105,7 @@ connections:
   attach_scale: 3.0       # endpoint attachment tolerance in stroke widths
 
 text:
+  regions: morph          # morph | craft (CRAFT word detector via easyocr; better on joined cursive)
   near_scale: 2.5         # "near" distance in text heights
   ocr: vlm                # vlm | consensus | trocr | tesseract | easyocr | none
   batch_size: 6           # crops per VLM call (sheet mode for single-image VLMs)
